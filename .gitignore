@@ -1,0 +1,17 @@
+# Environment
+.env
+
+# Bot data (contains user passwords)
+data/
+
+# Compiled binary
+bot
+
+# Go build cache
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
