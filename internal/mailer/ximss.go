@@ -14,7 +14,7 @@ import (
 const (
 	BaseURL    = "https://student.bmstu.ru"
 	WebmailURL = "https://student.bmstu.ru/hpronto/"
-	inbox      = "INBOX"
+	inbox      = "INBOX-MM-1"
 )
 
 type Message struct {
@@ -139,26 +139,31 @@ func GetNewMessages(email, password string, lastUID uint32) ([]Message, error) {
 }
 
 func browseFolder(s *ximssSession) ([]Message, error) {
-	body := fmt.Sprintf(
-		`<XIMSS><folderBrowse folder="%s" id="1"><index from="0" till="49"/><envelope/></folderBrowse></XIMSS>`,
-		inbox,
+	// folderOpen requires both mailbox (real) and folder (virtual) attributes,
+	// plus the list of fields to return in folderReport responses.
+	openData, err := s.call(
+		`<XIMSS><folderOpen mailbox="INBOX" sortField="INTERNALDATE" sortOrder="desc" folder="INBOX-MM-1" id="1">` +
+			`<field>FLAGS</field><field>Subject</field><field>INTERNALDATE</field>` +
+			`</folderOpen></XIMSS>`,
 	)
-
-	data, err := s.call(body)
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("[ximss] folderOpen: %s", openData)
 
+	data, err := s.call(
+		`<XIMSS><folderBrowse folder="INBOX-MM-1" id="2"><index from="0" till="49"/></folderBrowse></XIMSS>`,
+	)
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("[ximss] folderBrowse: %s", data)
 
 	var r struct {
 		XMLName xml.Name `xml:"XIMSS"`
 		Reports []struct {
-			UID      uint32 `xml:"UID,attr"`
-			Subject  string `xml:"SUBJECT"`
-			Envelope *struct {
-				Subject string `xml:"subject"`
-			} `xml:"envelope"`
+			UID     uint32 `xml:"UID,attr"`
+			Subject string `xml:"Subject"`
 		} `xml:"folderReport"`
 	}
 
@@ -169,9 +174,6 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 	var msgs []Message
 	for _, rep := range r.Reports {
 		subject := rep.Subject
-		if subject == "" && rep.Envelope != nil {
-			subject = rep.Envelope.Subject
-		}
 		if subject == "" {
 			subject = "(без темы)"
 		}

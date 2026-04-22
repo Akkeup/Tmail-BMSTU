@@ -71,14 +71,10 @@ func (b *Bot) handleLogin(msg *tgbotapi.Message) {
 
 	b.send(msg.Chat.ID, "Проверяю подключение к почте...")
 
-	if err := mailer.TestConnection(email, password); err != nil {
-		b.send(msg.Chat.ID, fmt.Sprintf("Ошибка подключения: %v", err))
-		return
-	}
-
+	// Single session: connect + get baseline UID
 	maxUID, err := mailer.GetMaxUID(email, password)
 	if err != nil {
-		b.send(msg.Chat.ID, "Не удалось получить данные почты.")
+		b.send(msg.Chat.ID, fmt.Sprintf("Ошибка подключения: %v", err))
 		return
 	}
 
