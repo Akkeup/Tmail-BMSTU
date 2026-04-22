@@ -5,7 +5,7 @@
 data/
 
 # Compiled binary
-bot
+/bot
 
 # Go build cache
 *.test
