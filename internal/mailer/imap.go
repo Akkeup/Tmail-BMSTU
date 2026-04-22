@@ -3,10 +3,14 @@ package mailer
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
+	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 )
+
+const dialTimeout = 15 * time.Second
 
 const (
 	IMAPServer = "student.bmstu.ru:993"
@@ -18,21 +22,32 @@ type Message struct {
 	Subject string
 }
 
+func dialTLS(cfg *tls.Config) (*client.Client, error) {
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", IMAPServer, cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetDeadline(time.Now().Add(dialTimeout))
+	c, err := client.New(conn)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	conn.SetDeadline(time.Time{}) // снять дедлайн после handshake
+	return c, nil
+}
+
 func dial(email, password string) (*client.Client, error) {
-	// Allow TLS 1.0+ — many university mail servers run older TLS versions
-	// that Go 1.18+ disables by default.
 	cfg := &tls.Config{
 		ServerName: "student.bmstu.ru",
 		MinVersion: tls.VersionTLS10,
 	}
-	c, err := client.DialTLS(IMAPServer, cfg)
+	c, err := dialTLS(cfg)
 	if err != nil {
-		// Last resort: skip cert verification (self-signed university certs)
-		cfg2 := &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS10,
-		}
-		c, err = client.DialTLS(IMAPServer, cfg2)
+		// Повтор с отключённой проверкой сертификата (self-signed)
+		cfg2 := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS10}
+		c, err = dialTLS(cfg2)
 		if err != nil {
 			return nil, fmt.Errorf("не удалось подключиться к почтовому серверу: %w", err)
 		}
