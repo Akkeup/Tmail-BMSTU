@@ -15,7 +15,12 @@ func main() {
 		log.Fatal("BOT_TOKEN env variable not set")
 	}
 
-	store, err := storage.New("data/users.json")
+	secret := os.Getenv("SECRET_KEY")
+	if secret == "" {
+		log.Fatal("SECRET_KEY env variable not set")
+	}
+
+	store, err := storage.New("data/users.json", secret)
 	if err != nil {
 		log.Fatalf("storage: %v", err)
 	}

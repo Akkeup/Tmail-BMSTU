@@ -1,7 +1,14 @@
 package storage
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"sync"
 )
@@ -17,12 +24,15 @@ type Storage struct {
 	mu    sync.RWMutex
 	path  string
 	users map[int64]*User
+	key   []byte
 }
 
-func New(path string) (*Storage, error) {
+func New(path, secret string) (*Storage, error) {
+	h := sha256.Sum256([]byte(secret))
 	s := &Storage{
 		path:  path,
 		users: make(map[int64]*User),
+		key:   h[:],
 	}
 	if err := s.load(); err != nil && !os.IsNotExist(err) {
 		return nil, err
@@ -30,20 +40,99 @@ func New(path string) (*Storage, error) {
 	return s, nil
 }
 
+func (s *Storage) encrypt(plaintext string) (string, error) {
+	block, err := aes.NewCipher(s.key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+func (s *Storage) decrypt(encoded string) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(s.key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(data) < gcm.NonceSize() {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	nonce, ct := data[:gcm.NonceSize()], data[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
+}
+
+// on-disk format keeps passwords encrypted
+type diskUser struct {
+	ChatID   int64  `json:"chat_id"`
+	Email    string `json:"email"`
+	Password string `json:"password"` // AES-256-GCM + base64
+	LastUID  uint32 `json:"last_uid"`
+}
+
 func (s *Storage) load() error {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &s.users)
+	var raw map[int64]*diskUser
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for id, u := range raw {
+		pwd, err := s.decrypt(u.Password)
+		if err != nil {
+			// backward compat: file written before encryption was added
+			pwd = u.Password
+		}
+		s.users[id] = &User{
+			ChatID:   u.ChatID,
+			Email:    u.Email,
+			Password: pwd,
+			LastUID:  u.LastUID,
+		}
+	}
+	return nil
 }
 
 func (s *Storage) save() error {
-	data, err := json.MarshalIndent(s.users, "", "  ")
+	disk := make(map[int64]*diskUser, len(s.users))
+	for id, u := range s.users {
+		enc, err := s.encrypt(u.Password)
+		if err != nil {
+			return fmt.Errorf("encrypt: %w", err)
+		}
+		disk[id] = &diskUser{
+			ChatID:   u.ChatID,
+			Email:    u.Email,
+			Password: enc,
+			LastUID:  u.LastUID,
+		}
+	}
+	out, err := json.MarshalIndent(disk, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0600)
+	return os.WriteFile(s.path, out, 0600)
 }
 
 func (s *Storage) Set(user *User) error {

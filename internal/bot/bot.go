@@ -3,7 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
-	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -11,10 +11,25 @@ import (
 	"tg-mail-bot/internal/storage"
 )
 
+type loginStep int
+
+const (
+	stepIdle loginStep = iota
+	stepWaitEmail
+	stepWaitPassword
+)
+
+type loginState struct {
+	step  loginStep
+	email string
+}
+
 type Bot struct {
 	api          *tgbotapi.BotAPI
 	store        *storage.Storage
 	pollInterval time.Duration
+	states       map[int64]*loginState
+	statesMu     sync.Mutex
 }
 
 func New(token string, store *storage.Storage, pollInterval time.Duration) (*Bot, error) {
@@ -23,7 +38,12 @@ func New(token string, store *storage.Storage, pollInterval time.Duration) (*Bot
 		return nil, err
 	}
 	log.Printf("Authorized as @%s", api.Self.UserName)
-	return &Bot{api: api, store: store, pollInterval: pollInterval}, nil
+	return &Bot{
+		api:          api,
+		store:        store,
+		pollInterval: pollInterval,
+		states:       make(map[int64]*loginState),
+	}, nil
 }
 
 func (b *Bot) Run() {
@@ -32,7 +52,7 @@ func (b *Bot) Run() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	for update := range b.api.GetUpdatesChan(u) {
-		if update.Message == nil || !update.Message.IsCommand() {
+		if update.Message == nil {
 			continue
 		}
 		b.handle(update.Message)
@@ -40,75 +60,95 @@ func (b *Bot) Run() {
 }
 
 func (b *Bot) handle(msg *tgbotapi.Message) {
-	switch msg.Command() {
-	case "start":
-		b.send(msg.Chat.ID,
-			"Привет! Я уведомляю о новых письмах на student.bmstu.ru.\n\n"+
-				"Команды:\n"+
-				"/login почта пароль — подключить почту\n"+
-				"/status — проверить статус подключения\n"+
-				"/logout — отключить уведомления",
-		)
+	if msg.IsCommand() {
+		b.clearState(msg.Chat.ID)
+		switch msg.Command() {
+		case "start":
+			b.send(msg.Chat.ID,
+				"Привет! Я уведомляю о новых письмах на student.bmstu.ru.\n\n"+
+					"Команды:\n"+
+					"/login — подключить почту\n"+
+					"/status — проверить статус\n"+
+					"/logout — отключить уведомления",
+			)
+		case "login":
+			b.setState(msg.Chat.ID, &loginState{step: stepWaitEmail})
+			b.send(msg.Chat.ID, "Введи адрес студенческой почты:")
+		case "logout":
+			_ = b.store.Delete(msg.Chat.ID)
+			b.send(msg.Chat.ID, "Отключено. Уведомления остановлены.")
+		case "status":
+			user, ok := b.store.Get(msg.Chat.ID)
+			if !ok {
+				b.send(msg.Chat.ID, "Не подключено. Используй /login")
+				return
+			}
+			b.send(msg.Chat.ID, fmt.Sprintf("Активно\nПочта: %s\nПроверка каждые %v.", user.Email, b.pollInterval))
+		}
+		return
+	}
 
-	case "login":
-		b.handleLogin(msg)
+	b.handleText(msg)
+}
 
-	case "logout":
-		b.handleLogout(msg)
+func (b *Bot) handleText(msg *tgbotapi.Message) {
+	b.statesMu.Lock()
+	state := b.states[msg.Chat.ID]
+	b.statesMu.Unlock()
 
-	case "status":
-		b.handleStatus(msg)
+	if state == nil {
+		return
+	}
+
+	switch state.step {
+	case stepWaitEmail:
+		state.email = msg.Text
+		state.step = stepWaitPassword
+		b.send(msg.Chat.ID, "Теперь введи пароль:\n(удали это сообщение после отправки)")
+
+	case stepWaitPassword:
+		email := state.email
+		password := msg.Text
+		b.clearState(msg.Chat.ID)
+		b.processLogin(msg.Chat.ID, email, password)
 	}
 }
 
-func (b *Bot) handleLogin(msg *tgbotapi.Message) {
-	args := strings.Fields(msg.CommandArguments())
-	if len(args) != 2 {
-		b.send(msg.Chat.ID, "Использование:\n/login почта@student.bmstu.ru пароль")
-		return
-	}
-	email, password := args[0], args[1]
+func (b *Bot) processLogin(chatID int64, email, password string) {
+	b.send(chatID, "Проверяю подключение к почте...")
 
-	b.send(msg.Chat.ID, "Проверяю подключение к почте...")
-
-	// Single session: connect + get baseline UID
 	maxUID, err := mailer.GetMaxUID(email, password)
 	if err != nil {
-		b.send(msg.Chat.ID, fmt.Sprintf("Ошибка подключения: %v", err))
+		b.send(chatID, fmt.Sprintf("Ошибка подключения: %v", err))
 		return
 	}
 
 	if err := b.store.Set(&storage.User{
-		ChatID:   msg.Chat.ID,
+		ChatID:   chatID,
 		Email:    email,
 		Password: password,
 		LastUID:  maxUID,
 	}); err != nil {
-		b.send(msg.Chat.ID, "Ошибка сохранения данных.")
+		b.send(chatID, "Ошибка сохранения данных.")
 		return
 	}
 
-	b.send(msg.Chat.ID, fmt.Sprintf(
+	b.send(chatID, fmt.Sprintf(
 		"Подключено!\nСлежу за почтой: %s\nПроверка каждые %v.",
 		email, b.pollInterval,
 	))
 }
 
-func (b *Bot) handleLogout(msg *tgbotapi.Message) {
-	_ = b.store.Delete(msg.Chat.ID)
-	b.send(msg.Chat.ID, "Отключено. Уведомления остановлены.")
+func (b *Bot) setState(chatID int64, state *loginState) {
+	b.statesMu.Lock()
+	defer b.statesMu.Unlock()
+	b.states[chatID] = state
 }
 
-func (b *Bot) handleStatus(msg *tgbotapi.Message) {
-	user, ok := b.store.Get(msg.Chat.ID)
-	if !ok {
-		b.send(msg.Chat.ID, "Не подключено. Используйте /login почта пароль")
-		return
-	}
-	b.send(msg.Chat.ID, fmt.Sprintf(
-		"Активно\nПочта: %s\nПроверка каждые %v.",
-		user.Email, b.pollInterval,
-	))
+func (b *Bot) clearState(chatID int64) {
+	b.statesMu.Lock()
+	defer b.statesMu.Unlock()
+	delete(b.states, chatID)
 }
 
 func (b *Bot) pollLoop() {
@@ -128,13 +168,11 @@ func (b *Bot) checkUser(user storage.User) error {
 	if err != nil {
 		return err
 	}
-
 	for _, m := range msgs {
 		b.send(user.ChatID, fmt.Sprintf(
 			"Новое письмо!\n\nТема: %s\n\nОткрыть почту: %s",
 			m.Subject, mailer.WebmailURL,
 		))
-
 		if m.UID > user.LastUID {
 			user.LastUID = m.UID
 			if err := b.store.UpdateLastUID(user.ChatID, m.UID); err != nil {

@@ -4,6 +4,7 @@ services:
     restart: always
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
+      - SECRET_KEY=${SECRET_KEY}
       - POLL_INTERVAL=${POLL_INTERVAL:-2m}
     volumes:
       - ./data:/app/data
