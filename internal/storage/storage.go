@@ -37,6 +37,12 @@ func New(path, secret string) (*Storage, error) {
 	if err := s.load(); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
+	// Re-save immediately to encrypt any plaintext passwords from older versions
+	if len(s.users) > 0 {
+		if err := s.save(); err != nil {
+			return nil, fmt.Errorf("migrate passwords: %w", err)
+		}
+	}
 	return s, nil
 }
 
