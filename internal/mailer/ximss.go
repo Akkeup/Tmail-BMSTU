@@ -20,6 +20,7 @@ const (
 type Message struct {
 	UID     uint32
 	Subject string
+	From    string
 }
 
 type ximssSession struct {
@@ -143,7 +144,7 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 	// plus the list of fields to return in folderReport responses.
 	openData, err := s.call(
 		`<XIMSS><folderOpen mailbox="INBOX" sortField="INTERNALDATE" sortOrder="desc" folder="INBOX-MM-1" id="1">` +
-			`<field>FLAGS</field><field>Subject</field><field>INTERNALDATE</field>` +
+			`<field>FLAGS</field><field>Subject</field><field>E-From</field><field>INTERNALDATE</field>` +
 			`</folderOpen></XIMSS>`,
 	)
 	if err != nil {
@@ -164,6 +165,7 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 		Reports []struct {
 			UID     uint32 `xml:"UID,attr"`
 			Subject string `xml:"Subject"`
+			From    string `xml:"E-From"`
 		} `xml:"folderReport"`
 	}
 
@@ -177,7 +179,7 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 		if subject == "" {
 			subject = "(без темы)"
 		}
-		msgs = append(msgs, Message{UID: rep.UID, Subject: subject})
+		msgs = append(msgs, Message{UID: rep.UID, Subject: subject, From: rep.From})
 	}
 	return msgs, nil
 }

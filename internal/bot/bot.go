@@ -170,8 +170,8 @@ func (b *Bot) checkUser(user storage.User) error {
 	}
 	for _, m := range msgs {
 		b.send(user.ChatID, fmt.Sprintf(
-			"Новое письмо!\n\nТема: %s\n\nОткрыть почту: %s",
-			m.Subject, mailer.WebmailURL,
+			"Новое письмо!\n\nОт: %s\nТема: %s\n\nОткрыть почту: %s",
+			m.From, m.Subject, mailer.WebmailURL,
 		))
 		if m.UID > user.LastUID {
 			user.LastUID = m.UID
