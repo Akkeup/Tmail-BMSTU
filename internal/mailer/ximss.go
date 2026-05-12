@@ -235,6 +235,10 @@ func fetchAttachments(s *ximssSession, uid uint32) ([]Attachment, error) {
 		}
 		data, err := io.ReadAll(io.LimitReader(attResp.Body, maxAttachmentSize))
 		attResp.Body.Close()
+		if attResp.StatusCode != http.StatusOK {
+			log.Printf("[ximss] attachment HTTP %d: %s", attResp.StatusCode, path)
+			continue
+		}
 		if err != nil || len(data) == 0 {
 			log.Printf("[ximss] read attachment %s: err=%v len=%d", path, err, len(data))
 			continue
