@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net/http"
 	"net/url"
 	"strings"
@@ -196,100 +199,73 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 }
 
 func fetchAttachments(s *ximssSession, uid uint32) ([]Attachment, error) {
-	data, err := s.call(fmt.Sprintf(
-		`<XIMSS><messageFetch folder="%s" UID="%d" id="1"><structure/></messageFetch></XIMSS>`,
-		inbox, uid,
-	))
+	msgURL := fmt.Sprintf("%s/Session/%s/MIME/%s/%d", BaseURL, s.urlID, inbox, uid)
+	resp, err := s.client.Get(msgURL)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[ximss] structure UID=%d: %s", uid, data)
-
-	var r struct {
-		XMLName xml.Name `xml:"XIMSS"`
-		Struct  *struct {
-			Body *struct {
-				Parts []struct {
-					Type     string `xml:"type,attr"`
-					Name     string `xml:"name,attr"`
-					Filename string `xml:"filename,attr"`
-					Size     int    `xml:"size,attr"`
-					Encoding string `xml:"encoding,attr"`
-				} `xml:"bodyPart"`
-			} `xml:"body"`
-		} `xml:"messageStruct"`
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d fetching message %d", resp.StatusCode, uid)
 	}
 
-	if err := xml.Unmarshal(data, &r); err != nil {
-		return nil, fmt.Errorf("parse structure: %w", err)
-	}
-	if r.Struct == nil || r.Struct.Body == nil {
+	ct := resp.Header.Get("Content-Type")
+	log.Printf("[ximss] message UID=%d Content-Type: %s", uid, ct)
+
+	mediaType, params, err := mime.ParseMediaType(ct)
+	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
 		return nil, nil
 	}
 
+	mr := multipart.NewReader(resp.Body, params["boundary"])
 	var attachments []Attachment
-	for i, part := range r.Struct.Body.Parts {
-		name := part.Name
-		if name == "" {
-			name = part.Filename
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
 		}
-		// Skip inline text parts without explicit filename
-		if name == "" {
-			continue
+		if err != nil {
+			log.Printf("[ximss] multipart UID=%d: %v", uid, err)
+			break
 		}
-		if part.Size > maxAttachmentSize {
-			log.Printf("[ximss] skip %s: %d bytes (>50MB)", name, part.Size)
+
+		filename := part.FileName()
+		if filename == "" {
 			continue
 		}
 
-		content, err := downloadPart(s, uid, i+1)
-		if err != nil {
-			log.Printf("[ximss] download part %d UID=%d: %v", i+1, uid, err)
+		cte := strings.ToLower(strings.TrimSpace(part.Header.Get("Content-Transfer-Encoding")))
+		var data []byte
+		switch cte {
+		case "base64":
+			raw, _ := io.ReadAll(io.LimitReader(part, maxAttachmentSize))
+			clean := strings.NewReplacer("\r", "", "\n", "", " ", "", "\t", "").Replace(string(raw))
+			data, err = base64.StdEncoding.DecodeString(clean)
+			if err != nil {
+				data, err = base64.RawStdEncoding.DecodeString(clean)
+			}
+		case "quoted-printable":
+			data, err = io.ReadAll(io.LimitReader(quotedprintable.NewReader(part), maxAttachmentSize))
+		default:
+			data, err = io.ReadAll(io.LimitReader(part, maxAttachmentSize))
+		}
+
+		if err != nil || len(data) == 0 {
+			log.Printf("[ximss] read %s UID=%d: err=%v len=%d", filename, uid, err, len(data))
 			continue
 		}
+
+		partCT := part.Header.Get("Content-Type")
+		if i := strings.Index(partCT, ";"); i >= 0 {
+			partCT = strings.TrimSpace(partCT[:i])
+		}
+
+		log.Printf("[ximss] attachment %s (%d bytes) UID=%d", filename, len(data), uid)
 		attachments = append(attachments, Attachment{
-			Name:        name,
-			ContentType: part.Type,
-			Data:        content,
+			Name:        filename,
+			ContentType: partCT,
+			Data:        data,
 		})
 	}
 	return attachments, nil
-}
-
-func downloadPart(s *ximssSession, uid uint32, partNum int) ([]byte, error) {
-	data, err := s.call(fmt.Sprintf(
-		`<XIMSS><messageFetch folder="%s" UID="%d" id="1"><bodyPart>%d</bodyPart></messageFetch></XIMSS>`,
-		inbox, uid, partNum,
-	))
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[ximss] part %d UID=%d: %s", partNum, uid, data)
-
-	// Try known response element names for CommuniGate Pro
-	var r struct {
-		XMLName xml.Name `xml:"XIMSS"`
-		Data    *struct {
-			Encoding string `xml:"encoding,attr"`
-			Content  string `xml:",chardata"`
-		} `xml:"messageData"`
-	}
-
-	if err := xml.Unmarshal(data, &r); err != nil {
-		return nil, fmt.Errorf("parse part: %w", err)
-	}
-	if r.Data == nil {
-		return nil, fmt.Errorf("no data in response")
-	}
-
-	content := strings.TrimSpace(r.Data.Content)
-	if strings.EqualFold(r.Data.Encoding, "base64") {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			// try without strict padding
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-		}
-		return decoded, err
-	}
-	return []byte(content), nil
 }
