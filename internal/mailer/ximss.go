@@ -1,6 +1,7 @@
 package mailer
 
 import (
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -12,15 +13,24 @@ import (
 )
 
 const (
-	BaseURL    = "https://student.bmstu.ru"
-	WebmailURL = "https://student.bmstu.ru/hpronto/"
-	inbox      = "INBOX-MM-1"
+	BaseURL           = "https://student.bmstu.ru"
+	WebmailURL        = "https://student.bmstu.ru/hpronto/"
+	inbox             = "INBOX-MM-1"
+	maxAttachmentSize = 50 * 1024 * 1024 // 50 MB — Telegram limit
 )
 
+type Attachment struct {
+	Name        string
+	ContentType string
+	Data        []byte
+}
+
 type Message struct {
-	UID     uint32
-	Subject string
-	From    string
+	UID         uint32
+	Subject     string
+	From        string
+	ContentType string
+	Attachments []Attachment
 }
 
 type ximssSession struct {
@@ -85,17 +95,6 @@ func openSession(email, password string) (*ximssSession, error) {
 	return &ximssSession{urlID: r.Session.UrlID, client: c}, nil
 }
 
-// TestConnection checks that credentials are valid.
-func TestConnection(email, password string) error {
-	s, err := openSession(email, password)
-	if err != nil {
-		return err
-	}
-	s.close()
-	return nil
-}
-
-// GetMaxUID returns the current highest UID in INBOX (baseline on first login).
 func GetMaxUID(email, password string) (uint32, error) {
 	s, err := openSession(email, password)
 	if err != nil {
@@ -117,7 +116,6 @@ func GetMaxUID(email, password string) (uint32, error) {
 	return max, nil
 }
 
-// GetNewMessages returns messages with UID > lastUID.
 func GetNewMessages(email, password string, lastUID uint32) ([]Message, error) {
 	s, err := openSession(email, password)
 	if err != nil {
@@ -132,19 +130,26 @@ func GetNewMessages(email, password string, lastUID uint32) ([]Message, error) {
 
 	var result []Message
 	for _, m := range msgs {
-		if m.UID > lastUID {
-			result = append(result, m)
+		if m.UID <= lastUID {
+			continue
 		}
+		if strings.Contains(strings.ToLower(m.ContentType), "multipart") {
+			atts, err := fetchAttachments(s, m.UID)
+			if err != nil {
+				log.Printf("[ximss] attachments UID=%d: %v", m.UID, err)
+			} else {
+				m.Attachments = atts
+			}
+		}
+		result = append(result, m)
 	}
 	return result, nil
 }
 
 func browseFolder(s *ximssSession) ([]Message, error) {
-	// folderOpen requires both mailbox (real) and folder (virtual) attributes,
-	// plus the list of fields to return in folderReport responses.
 	openData, err := s.call(
 		`<XIMSS><folderOpen mailbox="INBOX" sortField="INTERNALDATE" sortOrder="desc" folder="INBOX-MM-1" id="1">` +
-			`<field>FLAGS</field><field>Subject</field><field>E-From</field><field>INTERNALDATE</field>` +
+			`<field>FLAGS</field><field>Subject</field><field>E-From</field><field>Content-Type</field><field>INTERNALDATE</field>` +
 			`</folderOpen></XIMSS>`,
 	)
 	if err != nil {
@@ -163,9 +168,10 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 	var r struct {
 		XMLName xml.Name `xml:"XIMSS"`
 		Reports []struct {
-			UID     uint32 `xml:"UID,attr"`
-			Subject string `xml:"Subject"`
-			From    string `xml:"E-From"`
+			UID         uint32 `xml:"UID,attr"`
+			Subject     string `xml:"Subject"`
+			From        string `xml:"E-From"`
+			ContentType string `xml:"Content-Type"`
 		} `xml:"folderReport"`
 	}
 
@@ -179,7 +185,111 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 		if subject == "" {
 			subject = "(без темы)"
 		}
-		msgs = append(msgs, Message{UID: rep.UID, Subject: subject, From: rep.From})
+		msgs = append(msgs, Message{
+			UID:         rep.UID,
+			Subject:     subject,
+			From:        rep.From,
+			ContentType: rep.ContentType,
+		})
 	}
 	return msgs, nil
+}
+
+func fetchAttachments(s *ximssSession, uid uint32) ([]Attachment, error) {
+	data, err := s.call(fmt.Sprintf(
+		`<XIMSS><messageFetch folder="%s" UID="%d" id="1"><structure/></messageFetch></XIMSS>`,
+		inbox, uid,
+	))
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[ximss] structure UID=%d: %s", uid, data)
+
+	var r struct {
+		XMLName xml.Name `xml:"XIMSS"`
+		Struct  *struct {
+			Body *struct {
+				Parts []struct {
+					Type     string `xml:"type,attr"`
+					Name     string `xml:"name,attr"`
+					Filename string `xml:"filename,attr"`
+					Size     int    `xml:"size,attr"`
+					Encoding string `xml:"encoding,attr"`
+				} `xml:"bodyPart"`
+			} `xml:"body"`
+		} `xml:"messageStruct"`
+	}
+
+	if err := xml.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("parse structure: %w", err)
+	}
+	if r.Struct == nil || r.Struct.Body == nil {
+		return nil, nil
+	}
+
+	var attachments []Attachment
+	for i, part := range r.Struct.Body.Parts {
+		name := part.Name
+		if name == "" {
+			name = part.Filename
+		}
+		// Skip inline text parts without explicit filename
+		if name == "" {
+			continue
+		}
+		if part.Size > maxAttachmentSize {
+			log.Printf("[ximss] skip %s: %d bytes (>50MB)", name, part.Size)
+			continue
+		}
+
+		content, err := downloadPart(s, uid, i+1)
+		if err != nil {
+			log.Printf("[ximss] download part %d UID=%d: %v", i+1, uid, err)
+			continue
+		}
+		attachments = append(attachments, Attachment{
+			Name:        name,
+			ContentType: part.Type,
+			Data:        content,
+		})
+	}
+	return attachments, nil
+}
+
+func downloadPart(s *ximssSession, uid uint32, partNum int) ([]byte, error) {
+	data, err := s.call(fmt.Sprintf(
+		`<XIMSS><messageFetch folder="%s" UID="%d" id="1"><bodyPart>%d</bodyPart></messageFetch></XIMSS>`,
+		inbox, uid, partNum,
+	))
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[ximss] part %d UID=%d: %s", partNum, uid, data)
+
+	// Try known response element names for CommuniGate Pro
+	var r struct {
+		XMLName xml.Name `xml:"XIMSS"`
+		Data    *struct {
+			Encoding string `xml:"encoding,attr"`
+			Content  string `xml:",chardata"`
+		} `xml:"messageData"`
+	}
+
+	if err := xml.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("parse part: %w", err)
+	}
+	if r.Data == nil {
+		return nil, fmt.Errorf("no data in response")
+	}
+
+	content := strings.TrimSpace(r.Data.Content)
+	if strings.EqualFold(r.Data.Encoding, "base64") {
+		decoded, err := base64.StdEncoding.DecodeString(content)
+		if err != nil {
+			// try without strict padding
+			decoded, err = base64.RawStdEncoding.DecodeString(content)
+		}
+		return decoded, err
+	}
+	return []byte(content), nil
 }

@@ -173,6 +173,15 @@ func (b *Bot) checkUser(user storage.User) error {
 			"Новое письмо!\n\nОт: %s\nТема: %s\n\nОткрыть почту: %s",
 			m.From, m.Subject, mailer.WebmailURL,
 		))
+		for _, att := range m.Attachments {
+			doc := tgbotapi.NewDocument(user.ChatID, tgbotapi.FileBytes{
+				Name:  att.Name,
+				Bytes: att.Data,
+			})
+			if _, err := b.api.Send(doc); err != nil {
+				log.Printf("send attachment %s: %v", att.Name, err)
+			}
+		}
 		if m.UID > user.LastUID {
 			user.LastUID = m.UID
 			if err := b.store.UpdateLastUID(user.ChatID, m.UID); err != nil {
