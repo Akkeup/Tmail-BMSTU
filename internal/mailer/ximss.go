@@ -1,16 +1,13 @@
 package mailer
 
 import (
-	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
-	"mime"
-	"mime/multipart"
-	"mime/quotedprintable"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -198,72 +195,67 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 	return msgs, nil
 }
 
+var attachRe = regexp.MustCompile(`MIME/[^"'\s<>]+-\d{2}-[A-Z]/[^"'\s<>]+`)
+
 func fetchAttachments(s *ximssSession, uid uint32) ([]Attachment, error) {
-	msgURL := fmt.Sprintf("%s/Session/%s/MIME/%s/%d", BaseURL, s.urlID, inbox, uid)
-	resp, err := s.client.Get(msgURL)
+	// Fetch the HTML view of the email to find attachment URLs
+	htmlURL := fmt.Sprintf("%s/Session/%s/%d", BaseURL, s.urlID, uid)
+	resp, err := s.client.Get(htmlURL)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d fetching message %d", resp.StatusCode, uid)
+		return nil, fmt.Errorf("HTTP %d fetching message view %d", resp.StatusCode, uid)
 	}
 
-	ct := resp.Header.Get("Content-Type")
-	log.Printf("[ximss] message UID=%d Content-Type: %s", uid, ct)
-
-	mediaType, params, err := mime.ParseMediaType(ct)
-	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
-		return nil, nil
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
+	log.Printf("[ximss] message view UID=%d (%d bytes)", uid, len(body))
 
-	mr := multipart.NewReader(resp.Body, params["boundary"])
+	// Find all attachment paths in the HTML
+	matches := attachRe.FindAllString(string(body), -1)
+	seen := make(map[string]bool)
 	var attachments []Attachment
-	for {
-		part, err := mr.NextPart()
-		if err == io.EOF {
-			break
+	for _, path := range matches {
+		if seen[path] {
+			continue
 		}
+		seen[path] = true
+
+		attURL := fmt.Sprintf("%s/Session/%s/%s", BaseURL, s.urlID, path)
+		log.Printf("[ximss] downloading attachment: %s", attURL)
+
+		attResp, err := s.client.Get(attURL)
 		if err != nil {
-			log.Printf("[ximss] multipart UID=%d: %v", uid, err)
-			break
-		}
-
-		filename := part.FileName()
-		if filename == "" {
+			log.Printf("[ximss] download %s: %v", attURL, err)
 			continue
 		}
-
-		cte := strings.ToLower(strings.TrimSpace(part.Header.Get("Content-Transfer-Encoding")))
-		var data []byte
-		switch cte {
-		case "base64":
-			raw, _ := io.ReadAll(io.LimitReader(part, maxAttachmentSize))
-			clean := strings.NewReplacer("\r", "", "\n", "", " ", "", "\t", "").Replace(string(raw))
-			data, err = base64.StdEncoding.DecodeString(clean)
-			if err != nil {
-				data, err = base64.RawStdEncoding.DecodeString(clean)
-			}
-		case "quoted-printable":
-			data, err = io.ReadAll(io.LimitReader(quotedprintable.NewReader(part), maxAttachmentSize))
-		default:
-			data, err = io.ReadAll(io.LimitReader(part, maxAttachmentSize))
-		}
-
+		data, err := io.ReadAll(io.LimitReader(attResp.Body, maxAttachmentSize))
+		attResp.Body.Close()
 		if err != nil || len(data) == 0 {
-			log.Printf("[ximss] read %s UID=%d: err=%v len=%d", filename, uid, err, len(data))
+			log.Printf("[ximss] read attachment %s: err=%v len=%d", path, err, len(data))
 			continue
 		}
 
-		partCT := part.Header.Get("Content-Type")
-		if i := strings.Index(partCT, ";"); i >= 0 {
-			partCT = strings.TrimSpace(partCT[:i])
+		// Extract filename from URL path (last segment, URL-decoded)
+		segments := strings.Split(path, "/")
+		filename, _ := url.PathUnescape(segments[len(segments)-1])
+		if filename == "" {
+			filename = segments[len(segments)-1]
+		}
+
+		ct := attResp.Header.Get("Content-Type")
+		if i := strings.Index(ct, ";"); i >= 0 {
+			ct = strings.TrimSpace(ct[:i])
 		}
 
 		log.Printf("[ximss] attachment %s (%d bytes) UID=%d", filename, len(data), uid)
 		attachments = append(attachments, Attachment{
 			Name:        filename,
-			ContentType: partCT,
+			ContentType: ct,
 			Data:        data,
 		})
 	}
