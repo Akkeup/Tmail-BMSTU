@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -252,9 +253,15 @@ func fetchPart(s *ximssSession, uid uint32, partNum int) (Attachment, bool, erro
 		return Attachment{}, true, nil
 	}
 
-	filename := parseContentDisposition(resp.Header.Get("Content-Disposition"))
+	cd := resp.Header.Get("Content-Disposition")
+	log.Printf("[ximss] UID=%d part %02d Content-Disposition: %q", uid, partNum, cd)
+	filename := parseContentDisposition(cd)
 	if filename == "" {
-		filename = fmt.Sprintf("attachment-%d", partNum)
+		ext := ""
+		if exts, _ := mime.ExtensionsByType(baseType); len(exts) > 0 {
+			ext = exts[0]
+		}
+		filename = fmt.Sprintf("attachment-%d%s", partNum, ext)
 	}
 
 	log.Printf("[ximss] attachment %s (%d bytes) UID=%d part=%02d", filename, len(data), uid, partNum)
