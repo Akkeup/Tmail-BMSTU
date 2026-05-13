@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"tg-mail-bot/internal/lks"
 	"tg-mail-bot/internal/mailer"
 	"tg-mail-bot/internal/storage"
 )
@@ -15,6 +16,10 @@ import (
 const (
 	mb               = 1024 * 1024
 	loginStateExpiry = 10 * time.Minute
+
+	btnSchedule = "📅 Расписание"
+	btnSport    = "🏃 Физкультура"
+	btnMap      = "🗺 Карта"
 )
 
 type loginStep int
@@ -23,6 +28,7 @@ const (
 	stepIdle loginStep = iota
 	stepWaitEmail
 	stepWaitPassword
+	stepWaitGroup
 )
 
 type loginState struct {
@@ -68,12 +74,40 @@ func (b *Bot) Run() {
 	}
 }
 
+// mainKeyboard returns the persistent reply keyboard shown to all users.
+func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(btnSchedule),
+			tgbotapi.NewKeyboardButton(btnSport),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(btnMap),
+		),
+	)
+}
+
+func (b *Bot) sendWithKeyboard(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = mainKeyboard()
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("send: %v", err)
+	}
+}
+
+func (b *Bot) send(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("send: %v", err)
+	}
+}
+
 func (b *Bot) handle(msg *tgbotapi.Message) {
 	if msg.IsCommand() {
 		b.clearState(msg.Chat.ID)
 		switch msg.Command() {
 		case "start":
-			b.send(msg.Chat.ID,
+			b.sendWithKeyboard(msg.Chat.ID,
 				"Привет! Я уведомляю о новых письмах на student.bmstu.ru.\n\n"+
 					"Команды:\n"+
 					"/login — подключить почту\n"+
@@ -105,6 +139,20 @@ func (b *Bot) handle(msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleText(msg *tgbotapi.Message) {
+	// Reply keyboard buttons
+	switch msg.Text {
+	case btnSchedule:
+		b.handleSchedule(msg.Chat.ID)
+		return
+	case btnSport:
+		b.handleSport(msg.Chat.ID)
+		return
+	case btnMap:
+		b.handleMap(msg.Chat.ID)
+		return
+	}
+
+	// Login / group setup flow
 	b.statesMu.Lock()
 	state := b.states[msg.Chat.ID]
 	b.statesMu.Unlock()
@@ -129,13 +177,15 @@ func (b *Bot) handleText(msg *tgbotapi.Message) {
 		password := msg.Text
 		b.clearState(msg.Chat.ID)
 
-		// Delete password message from chat history immediately
 		del := tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)
 		if _, err := b.api.Send(del); err != nil {
 			log.Printf("delete password msg: %v", err)
 		}
 
 		b.processLogin(msg.Chat.ID, email, password)
+
+	case stepWaitGroup:
+		b.processGroupSetup(msg.Chat.ID, msg.Text)
 	}
 }
 
@@ -158,11 +208,86 @@ func (b *Bot) processLogin(chatID int64, email, password string) {
 		return
 	}
 
-	b.send(chatID, fmt.Sprintf(
+	b.sendWithKeyboard(chatID, fmt.Sprintf(
 		"Подключено!\nСлежу за почтой: %s\nПроверка каждые %v.",
 		email, b.pollInterval,
 	))
 }
+
+// --- Schedule ---
+
+func (b *Bot) handleSchedule(chatID int64) {
+	user, ok := b.store.Get(chatID)
+	if !ok {
+		b.send(chatID, "Сначала подключи почту через /login")
+		return
+	}
+	if user.GroupUUID == "" {
+		b.setState(chatID, &loginState{step: stepWaitGroup, createdAt: time.Now()})
+		b.send(chatID, "Введи название своей группы (например: ИУ7-21Б):")
+		return
+	}
+	b.send(chatID, "Загружаю расписание...")
+	text, err := lks.GetTodaySchedule(user.GroupUUID)
+	if err != nil {
+		b.send(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err))
+		return
+	}
+	b.send(chatID, text)
+}
+
+func (b *Bot) processGroupSetup(chatID int64, groupName string) {
+	b.clearState(chatID)
+	b.send(chatID, "Ищу группу...")
+
+	uuid, err := lks.FindGroupUUID(groupName)
+	if err != nil {
+		b.send(chatID, fmt.Sprintf("%v\nПроверь название и попробуй ещё раз через кнопку «Расписание».", err))
+		return
+	}
+	if err := b.store.UpdateGroup(chatID, groupName, uuid); err != nil {
+		b.send(chatID, "Ошибка сохранения группы.")
+		return
+	}
+
+	text, err := lks.GetTodaySchedule(uuid)
+	if err != nil {
+		b.send(chatID, fmt.Sprintf("Группа сохранена. Ошибка загрузки расписания: %v", err))
+		return
+	}
+	b.send(chatID, text)
+}
+
+// --- Sport ---
+
+func (b *Bot) handleSport(chatID int64) {
+	user, ok := b.store.Get(chatID)
+	if !ok {
+		b.send(chatID, "Сначала подключи почту через /login")
+		return
+	}
+	b.send(chatID, "Загружаю данные физкультуры...")
+
+	c, err := lks.NewClient(user.Email, user.Password)
+	if err != nil {
+		b.send(chatID, fmt.Sprintf("Ошибка входа в ЛКС: %v", err))
+		return
+	}
+	text, err := lks.GetSportAttendance(c)
+	if err != nil {
+		b.send(chatID, fmt.Sprintf("Ошибка загрузки данных: %v", err))
+		return
+	}
+	b.send(chatID, text)
+}
+
+// --- Map ---
+
+func (b *Bot) handleMap(chatID int64) {
+	b.send(chatID, "🗺 Карта университета будет добавлена в ближайшее время.")
+}
+
+// --- State management ---
 
 func (b *Bot) setState(chatID int64, state *loginState) {
 	b.statesMu.Lock()
@@ -176,7 +301,6 @@ func (b *Bot) clearState(chatID int64) {
 	delete(b.states, chatID)
 }
 
-// expireStatesLoop removes login sessions that were started but never completed.
 func (b *Bot) expireStatesLoop() {
 	ticker := time.NewTicker(loginStateExpiry)
 	defer ticker.Stop()
@@ -191,6 +315,8 @@ func (b *Bot) expireStatesLoop() {
 		b.statesMu.Unlock()
 	}
 }
+
+// --- Mail polling ---
 
 func (b *Bot) pollLoop() {
 	ticker := time.NewTicker(b.pollInterval)
@@ -210,7 +336,6 @@ func (b *Bot) checkUser(user storage.User) error {
 		return err
 	}
 	for _, m := range msgs {
-		// Split attachments into sendable and too-large
 		var sendable []mailer.Attachment
 		var tooBig []mailer.Attachment
 		for _, att := range m.Attachments {
@@ -242,7 +367,6 @@ func (b *Bot) checkUser(user storage.User) error {
 				log.Printf("send attachment %s: %v", att.Name, err)
 			}
 		} else {
-			// All attachments in one media group, caption on first
 			media := make([]interface{}, len(sendable))
 			for i, att := range sendable {
 				item := tgbotapi.NewInputMediaDocument(tgbotapi.FileBytes{Name: att.Name, Bytes: att.Data})
@@ -264,11 +388,4 @@ func (b *Bot) checkUser(user storage.User) error {
 		}
 	}
 	return nil
-}
-
-func (b *Bot) send(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("send: %v", err)
-	}
 }

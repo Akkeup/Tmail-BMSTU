@@ -15,10 +15,12 @@ import (
 )
 
 type User struct {
-	ChatID   int64  `json:"chat_id"`
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	LastUID  uint32 `json:"last_uid"`
+	ChatID    int64  `json:"chat_id"`
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+	LastUID   uint32 `json:"last_uid"`
+	Group     string `json:"group,omitempty"`
+	GroupUUID string `json:"group_uuid,omitempty"`
 }
 
 type Storage struct {
@@ -90,10 +92,12 @@ func (s *Storage) decrypt(encoded string) (string, error) {
 
 // on-disk format keeps passwords encrypted
 type diskUser struct {
-	ChatID   int64  `json:"chat_id"`
-	Email    string `json:"email"`
-	Password string `json:"password"` // AES-256-GCM + base64
-	LastUID  uint32 `json:"last_uid"`
+	ChatID    int64  `json:"chat_id"`
+	Email     string `json:"email"`
+	Password  string `json:"password"` // AES-256-GCM + base64
+	LastUID   uint32 `json:"last_uid"`
+	Group     string `json:"group,omitempty"`
+	GroupUUID string `json:"group_uuid,omitempty"`
 }
 
 func (s *Storage) load() error {
@@ -112,10 +116,12 @@ func (s *Storage) load() error {
 			pwd = u.Password
 		}
 		s.users[id] = &User{
-			ChatID:   u.ChatID,
-			Email:    u.Email,
-			Password: pwd,
-			LastUID:  u.LastUID,
+			ChatID:    u.ChatID,
+			Email:     u.Email,
+			Password:  pwd,
+			LastUID:   u.LastUID,
+			Group:     u.Group,
+			GroupUUID: u.GroupUUID,
 		}
 	}
 	return nil
@@ -129,10 +135,12 @@ func (s *Storage) save() error {
 			return fmt.Errorf("encrypt: %w", err)
 		}
 		disk[id] = &diskUser{
-			ChatID:   u.ChatID,
-			Email:    u.Email,
-			Password: enc,
-			LastUID:  u.LastUID,
+			ChatID:    u.ChatID,
+			Email:     u.Email,
+			Password:  enc,
+			LastUID:   u.LastUID,
+			Group:     u.Group,
+			GroupUUID: u.GroupUUID,
 		}
 	}
 	out, err := json.MarshalIndent(disk, "", "  ")
@@ -186,6 +194,17 @@ func (s *Storage) UpdateLastUID(chatID int64, uid uint32) error {
 	defer s.mu.Unlock()
 	if u, ok := s.users[chatID]; ok {
 		u.LastUID = uid
+		return s.save()
+	}
+	return nil
+}
+
+func (s *Storage) UpdateGroup(chatID int64, group, groupUUID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u, ok := s.users[chatID]; ok {
+		u.Group = group
+		u.GroupUUID = groupUUID
 		return s.save()
 	}
 	return nil
