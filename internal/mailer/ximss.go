@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -195,73 +194,92 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 	return msgs, nil
 }
 
-var attachRe = regexp.MustCompile(`MIME/[^"'\s<>]+-\d{2}-[A-Z]/[^"'\s<>]+`)
-
 func fetchAttachments(s *ximssSession, uid uint32) ([]Attachment, error) {
-	// Fetch the HTML view of the email to find attachment URLs
-	htmlURL := fmt.Sprintf("%s/Session/%s/%d", BaseURL, s.urlID, uid)
-	resp, err := s.client.Get(htmlURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d fetching message view %d", resp.StatusCode, uid)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[ximss] message view UID=%d (%d bytes)", uid, len(body))
-
-	// Find all attachment paths in the HTML
-	matches := attachRe.FindAllString(string(body), -1)
-	seen := make(map[string]bool)
 	var attachments []Attachment
-	for _, path := range matches {
-		if seen[path] {
-			continue
-		}
-		seen[path] = true
-
-		attURL := fmt.Sprintf("%s/Session/%s/%s", BaseURL, s.urlID, path)
-		log.Printf("[ximss] downloading attachment: %s", attURL)
-
-		attResp, err := s.client.Get(attURL)
+	for partNum := 1; partNum <= 20; partNum++ {
+		att, skip, err := fetchPart(s, uid, partNum)
 		if err != nil {
-			log.Printf("[ximss] download %s: %v", attURL, err)
-			continue
+			break // part not found — no more parts
 		}
-		data, err := io.ReadAll(io.LimitReader(attResp.Body, maxAttachmentSize))
-		attResp.Body.Close()
-		if attResp.StatusCode != http.StatusOK {
-			log.Printf("[ximss] attachment HTTP %d: %s", attResp.StatusCode, path)
-			continue
+		if skip {
+			continue // body part, not an attachment
 		}
-		if err != nil || len(data) == 0 {
-			log.Printf("[ximss] read attachment %s: err=%v len=%d", path, err, len(data))
-			continue
-		}
-
-		// Extract filename from URL path (last segment, URL-decoded)
-		segments := strings.Split(path, "/")
-		filename, _ := url.PathUnescape(segments[len(segments)-1])
-		if filename == "" {
-			filename = segments[len(segments)-1]
-		}
-
-		ct := attResp.Header.Get("Content-Type")
-		if i := strings.Index(ct, ";"); i >= 0 {
-			ct = strings.TrimSpace(ct[:i])
-		}
-
-		log.Printf("[ximss] attachment %s (%d bytes) UID=%d", filename, len(data), uid)
-		attachments = append(attachments, Attachment{
-			Name:        filename,
-			ContentType: ct,
-			Data:        data,
-		})
+		attachments = append(attachments, att)
 	}
 	return attachments, nil
+}
+
+// fetchPart tries to download MIME part partNum of the message.
+// Returns (att, false, nil) for an attachment part,
+// (zero, true, nil) for a body part to skip,
+// (zero, false, err) if the part doesn't exist.
+func fetchPart(s *ximssSession, uid uint32, partNum int) (Attachment, bool, error) {
+	var resp *http.Response
+	for _, enc := range []string{"B", "Q"} {
+		u := fmt.Sprintf("%s/Session/%s/MIME/%s/%d-%02d-%s/x",
+			BaseURL, s.urlID, inbox, uid, partNum, enc)
+		r, err := s.client.Get(u)
+		if err != nil {
+			continue
+		}
+		if r.StatusCode == http.StatusOK {
+			resp = r
+			break
+		}
+		r.Body.Close()
+	}
+	if resp == nil {
+		return Attachment{}, false, fmt.Errorf("part %d not found", partNum)
+	}
+	defer resp.Body.Close()
+
+	ct := resp.Header.Get("Content-Type")
+	baseType := ct
+	if i := strings.Index(ct, ";"); i >= 0 {
+		baseType = strings.TrimSpace(ct[:i])
+	}
+	btLow := strings.ToLower(baseType)
+
+	// Skip body parts (text or multipart wrappers)
+	if strings.HasPrefix(btLow, "text/") || strings.HasPrefix(btLow, "multipart/") {
+		log.Printf("[ximss] UID=%d part %02d: skipping %s", uid, partNum, baseType)
+		return Attachment{}, true, nil
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentSize))
+	if err != nil || len(data) == 0 {
+		log.Printf("[ximss] UID=%d part %02d: read err=%v len=%d", uid, partNum, err, len(data))
+		return Attachment{}, true, nil
+	}
+
+	filename := parseContentDisposition(resp.Header.Get("Content-Disposition"))
+	if filename == "" {
+		filename = fmt.Sprintf("attachment-%d", partNum)
+	}
+
+	log.Printf("[ximss] attachment %s (%d bytes) UID=%d part=%02d", filename, len(data), uid, partNum)
+	return Attachment{Name: filename, ContentType: baseType, Data: data}, false, nil
+}
+
+// parseContentDisposition extracts filename from Content-Disposition header.
+func parseContentDisposition(cd string) string {
+	// Try filename*= (RFC 5987): UTF-8''encoded-name
+	if i := strings.Index(cd, "filename*="); i >= 0 {
+		s := cd[i+10:]
+		if j := strings.LastIndex(s, "'"); j >= 0 {
+			if decoded, err := url.PathUnescape(s[j+1:]); err == nil && decoded != "" {
+				return strings.TrimSpace(decoded)
+			}
+		}
+	}
+	// Try filename="..."
+	if i := strings.Index(cd, "filename="); i >= 0 {
+		s := strings.TrimSpace(cd[i+9:])
+		s = strings.Trim(s, "\"")
+		if j := strings.Index(s, ";"); j >= 0 {
+			s = strings.TrimSpace(s[:j])
+		}
+		return s
+	}
+	return ""
 }
