@@ -17,9 +17,13 @@ const (
 	mb               = 1024 * 1024
 	loginStateExpiry = 10 * time.Minute
 
-	btnSchedule = "📅 Расписание"
-	btnSport    = "🏃 Физкультура"
-	btnMap      = "🗺 Карта"
+	// Callback data for inline keyboard buttons
+	cbMenu     = "menu"
+	cbSchedule = "schedule"
+	cbSport    = "sport"
+	cbMap      = "map"
+
+	navText = "BMSTU Mail Bot — выбери раздел:"
 )
 
 type loginStep int
@@ -35,6 +39,7 @@ type loginState struct {
 	step      loginStep
 	email     string
 	createdAt time.Time
+	navMsgID  int // nav message to edit after group setup
 }
 
 type Bot struct {
@@ -43,6 +48,8 @@ type Bot struct {
 	pollInterval time.Duration
 	states       map[int64]*loginState
 	statesMu     sync.Mutex
+	navMsgs      map[int64]int // chatID → nav message ID
+	navMu        sync.Mutex
 }
 
 func New(token string, store *storage.Storage, pollInterval time.Duration) (*Bot, error) {
@@ -56,6 +63,7 @@ func New(token string, store *storage.Storage, pollInterval time.Duration) (*Bot
 		store:        store,
 		pollInterval: pollInterval,
 		states:       make(map[int64]*loginState),
+		navMsgs:      make(map[int64]int),
 	}
 	go b.expireStatesLoop()
 	return b, nil
@@ -67,53 +75,107 @@ func (b *Bot) Run() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	for update := range b.api.GetUpdatesChan(u) {
-		if update.Message == nil {
-			continue
+		if update.Message != nil {
+			b.handle(update.Message)
+		} else if update.CallbackQuery != nil {
+			b.handleCallback(update.CallbackQuery)
 		}
-		b.handle(update.Message)
 	}
 }
 
-// mainKeyboard returns the persistent reply keyboard shown to all users.
-func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
-	return tgbotapi.NewReplyKeyboard(
-		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton(btnSchedule),
-			tgbotapi.NewKeyboardButton(btnSport),
+// --- Keyboards ---
+
+func mainKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📅 Расписание", cbSchedule),
+			tgbotapi.NewInlineKeyboardButtonData("🏃 Физкультура", cbSport),
 		),
-		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton(btnMap),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🗺 Карта", cbMap),
 		),
 	)
 }
 
-func (b *Bot) sendWithKeyboard(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyMarkup = mainKeyboard()
-	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("send: %v", err)
+func backKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("← Меню", cbMenu),
+		),
+	)
+}
+
+// --- Nav message helpers ---
+
+// sendNav sends a new nav message and remembers its ID.
+func (b *Bot) sendNav(chatID int64) {
+	kb := mainKeyboard()
+	msg := tgbotapi.NewMessage(chatID, navText)
+	msg.ReplyMarkup = kb
+	sent, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("sendNav: %v", err)
+		return
+	}
+	b.navMu.Lock()
+	b.navMsgs[chatID] = sent.MessageID
+	b.navMu.Unlock()
+}
+
+// editNav edits the nav message to new text + keyboard. Falls back to sending if not found.
+func (b *Bot) editNav(chatID int64, text string, kb tgbotapi.InlineKeyboardMarkup) {
+	b.navMu.Lock()
+	msgID := b.navMsgs[chatID]
+	b.navMu.Unlock()
+
+	if msgID == 0 {
+		b.sendNav(chatID)
+		return
+	}
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ReplyMarkup = &kb
+	if _, err := b.api.Send(edit); err != nil {
+		// Nav message was deleted — send a fresh one
+		log.Printf("editNav (fallback to send): %v", err)
+		b.navMu.Lock()
+		b.navMsgs[chatID] = 0
+		b.navMu.Unlock()
+		b.sendNav(chatID)
 	}
 }
 
-func (b *Bot) send(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("send: %v", err)
+// editNavFromCallback edits the message that was the source of the callback.
+func (b *Bot) editNavFromCallback(cq *tgbotapi.CallbackQuery, text string, kb tgbotapi.InlineKeyboardMarkup) {
+	chatID := cq.Message.Chat.ID
+	msgID := cq.Message.MessageID
+
+	b.navMu.Lock()
+	b.navMsgs[chatID] = msgID
+	b.navMu.Unlock()
+
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ReplyMarkup = &kb
+	if _, err := b.api.Send(edit); err != nil {
+		log.Printf("editNavFromCallback: %v", err)
 	}
 }
+
+// --- Commands ---
 
 func (b *Bot) handle(msg *tgbotapi.Message) {
 	if msg.IsCommand() {
 		b.clearState(msg.Chat.ID)
 		switch msg.Command() {
 		case "start":
-			b.sendWithKeyboard(msg.Chat.ID,
+			b.send(msg.Chat.ID,
 				"Привет! Я уведомляю о новых письмах на student.bmstu.ru.\n\n"+
 					"Команды:\n"+
 					"/login — подключить почту\n"+
 					"/status — проверить статус\n"+
 					"/logout — отключить уведомления",
 			)
+			b.sendNav(msg.Chat.ID)
+
 		case "login":
 			b.setState(msg.Chat.ID, &loginState{step: stepWaitEmail, createdAt: time.Now()})
 			b.send(msg.Chat.ID,
@@ -121,9 +183,11 @@ func (b *Bot) handle(msg *tgbotapi.Message) {
 					"Для подключения нужна полная бауманская почта (student.bmstu.ru) и пароль от неё.\n\n"+
 					"Введи адрес почты:",
 			)
+
 		case "logout":
 			_ = b.store.Delete(msg.Chat.ID)
 			b.send(msg.Chat.ID, "Отключено. Уведомления остановлены.")
+
 		case "status":
 			user, ok := b.store.Get(msg.Chat.ID)
 			if !ok {
@@ -139,20 +203,6 @@ func (b *Bot) handle(msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleText(msg *tgbotapi.Message) {
-	// Reply keyboard buttons
-	switch msg.Text {
-	case btnSchedule:
-		b.handleSchedule(msg.Chat.ID)
-		return
-	case btnSport:
-		b.handleSport(msg.Chat.ID)
-		return
-	case btnMap:
-		b.handleMap(msg.Chat.ID)
-		return
-	}
-
-	// Login / group setup flow
 	b.statesMu.Lock()
 	state := b.states[msg.Chat.ID]
 	b.statesMu.Unlock()
@@ -185,9 +235,37 @@ func (b *Bot) handleText(msg *tgbotapi.Message) {
 		b.processLogin(msg.Chat.ID, email, password)
 
 	case stepWaitGroup:
-		b.processGroupSetup(msg.Chat.ID, msg.Text)
+		navMsgID := state.navMsgID
+		b.clearState(msg.Chat.ID)
+		b.processGroupSetup(msg.Chat.ID, navMsgID, msg.Text)
 	}
 }
+
+// --- Callback handler ---
+
+func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
+	// Acknowledge the callback to remove the loading spinner
+	b.api.Send(tgbotapi.NewCallback(cq.ID, ""))
+
+	chatID := cq.Message.Chat.ID
+
+	switch cq.Data {
+	case cbMenu:
+		b.editNavFromCallback(cq, navText, mainKeyboard())
+
+	case cbSchedule:
+		b.callbackSchedule(cq)
+
+	case cbSport:
+		b.callbackSport(cq)
+
+	case cbMap:
+		b.editNavFromCallback(cq, "🗺 Карта университета будет добавлена в ближайшее время.", backKeyboard())
+		_ = chatID
+	}
+}
+
+// --- Login ---
 
 func (b *Bot) processLogin(chatID int64, email, password string) {
 	b.send(chatID, "Проверяю подключение к почте...")
@@ -208,83 +286,101 @@ func (b *Bot) processLogin(chatID int64, email, password string) {
 		return
 	}
 
-	b.sendWithKeyboard(chatID, fmt.Sprintf(
-		"Подключено!\nСлежу за почтой: %s\nПроверка каждые %v.",
-		email, b.pollInterval,
-	))
+	b.send(chatID, fmt.Sprintf("Подключено! Слежу за почтой: %s\nПроверка каждые %v.", email, b.pollInterval))
+	b.sendNav(chatID)
 }
 
 // --- Schedule ---
 
-func (b *Bot) handleSchedule(chatID int64) {
+func (b *Bot) callbackSchedule(cq *tgbotapi.CallbackQuery) {
+	chatID := cq.Message.Chat.ID
+	msgID := cq.Message.MessageID
+
 	user, ok := b.store.Get(chatID)
 	if !ok {
-		b.send(chatID, "Сначала подключи почту через /login")
+		b.editNavFromCallback(cq, "Сначала подключи почту через /login", backKeyboard())
 		return
 	}
+
 	if user.GroupUUID == "" {
-		b.setState(chatID, &loginState{step: stepWaitGroup, createdAt: time.Now()})
-		b.send(chatID, "Введи название своей группы (например: ИУ7-21Б):")
+		// Ask for group — edit nav to prompt, set state
+		b.navMu.Lock()
+		b.navMsgs[chatID] = msgID
+		b.navMu.Unlock()
+
+		b.setState(chatID, &loginState{
+			step:      stepWaitGroup,
+			createdAt: time.Now(),
+			navMsgID:  msgID,
+		})
+		b.editNavFromCallback(cq,
+			"📅 Расписание\n\nВведи название своей группы (например: ИУ7-21Б):",
+			backKeyboard(),
+		)
 		return
 	}
-	b.send(chatID, "Загружаю расписание...")
+
+	b.editNavFromCallback(cq, "📅 Загружаю расписание...", backKeyboard())
+
 	text, err := lks.GetTodaySchedule(user.GroupUUID)
 	if err != nil {
-		b.send(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err))
+		b.editNav(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err), backKeyboard())
 		return
 	}
-	b.send(chatID, text)
+	b.editNav(chatID, text, backKeyboard())
 }
 
-func (b *Bot) processGroupSetup(chatID int64, groupName string) {
-	b.clearState(chatID)
-	b.send(chatID, "Ищу группу...")
+func (b *Bot) processGroupSetup(chatID int64, navMsgID int, groupName string) {
+	// Update nav message to show loading
+	if navMsgID != 0 {
+		kb := backKeyboard()
+		edit := tgbotapi.NewEditMessageText(chatID, navMsgID, "📅 Расписание\n\nИщу группу...")
+		edit.ReplyMarkup = &kb
+		b.api.Send(edit)
+	}
 
 	uuid, err := lks.FindGroupUUID(groupName)
 	if err != nil {
-		b.send(chatID, fmt.Sprintf("%v\nПроверь название и попробуй ещё раз через кнопку «Расписание».", err))
+		b.editNav(chatID, fmt.Sprintf("📅 Расписание\n\n%v\n\nПроверь название и нажми кнопку снова.", err), backKeyboard())
 		return
 	}
 	if err := b.store.UpdateGroup(chatID, groupName, uuid); err != nil {
-		b.send(chatID, "Ошибка сохранения группы.")
+		b.editNav(chatID, "Ошибка сохранения группы.", backKeyboard())
 		return
 	}
 
 	text, err := lks.GetTodaySchedule(uuid)
 	if err != nil {
-		b.send(chatID, fmt.Sprintf("Группа сохранена. Ошибка загрузки расписания: %v", err))
+		b.editNav(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err), backKeyboard())
 		return
 	}
-	b.send(chatID, text)
+	b.editNav(chatID, text, backKeyboard())
 }
 
 // --- Sport ---
 
-func (b *Bot) handleSport(chatID int64) {
+func (b *Bot) callbackSport(cq *tgbotapi.CallbackQuery) {
+	chatID := cq.Message.Chat.ID
+
 	user, ok := b.store.Get(chatID)
 	if !ok {
-		b.send(chatID, "Сначала подключи почту через /login")
+		b.editNavFromCallback(cq, "Сначала подключи почту через /login", backKeyboard())
 		return
 	}
-	b.send(chatID, "Загружаю данные физкультуры...")
+
+	b.editNavFromCallback(cq, "🏃 Загружаю данные физкультуры...", backKeyboard())
 
 	c, err := lks.NewClient(user.Email, user.Password)
 	if err != nil {
-		b.send(chatID, fmt.Sprintf("Ошибка входа в ЛКС: %v", err))
+		b.editNav(chatID, fmt.Sprintf("Ошибка входа в ЛКС: %v", err), backKeyboard())
 		return
 	}
 	text, err := lks.GetSportAttendance(c)
 	if err != nil {
-		b.send(chatID, fmt.Sprintf("Ошибка загрузки данных: %v", err))
+		b.editNav(chatID, fmt.Sprintf("Ошибка загрузки данных: %v", err), backKeyboard())
 		return
 	}
-	b.send(chatID, text)
-}
-
-// --- Map ---
-
-func (b *Bot) handleMap(chatID int64) {
-	b.send(chatID, "🗺 Карта университета будет добавлена в ближайшее время.")
+	b.editNav(chatID, text, backKeyboard())
 }
 
 // --- State management ---
@@ -388,4 +484,11 @@ func (b *Bot) checkUser(user storage.User) error {
 		}
 	}
 	return nil
+}
+
+func (b *Bot) send(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("send: %v", err)
+	}
 }
