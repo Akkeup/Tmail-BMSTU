@@ -56,21 +56,24 @@ func main() {
 		}
 	}
 
-	// --- Диагностика: структура (первые 500 байт) ---
-	fmt.Println("\n=== Диагностика Structure API ===")
-	{
-		resp, err := (&http.Client{Timeout: 10 * time.Second}).Get("https://lks.bmstu.ru/lks-back/api/v1/structure")
+	// --- Диагностика: текущая неделя и полное расписание ---
+	fmt.Println("\n=== Диагностика Schedule API ===")
+	for _, path := range []string{
+		"/schedules/current",
+		"/schedules/groups/814a726c-bc7e-11ee-b32d-df9b99f124c0/public",
+	} {
+		resp, err := (&http.Client{Timeout: 10 * time.Second}).Get("https://lks.bmstu.ru/lks-back/api/v1" + path)
 		if err != nil {
-			fmt.Printf("  ОШИБКА: %v\n", err)
-		} else {
-			data, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			snippet := string(data)
-			if len(snippet) > 800 {
-				snippet = snippet[:800] + "..."
-			}
-			fmt.Printf("  %s\n", snippet)
+			fmt.Printf("  GET %s → ОШИБКА: %v\n", path, err)
+			continue
 		}
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		snippet := string(data)
+		if len(snippet) > 1200 {
+			snippet = snippet[:1200] + "..."
+		}
+		fmt.Printf("  GET %s →\n%s\n\n", path, snippet)
 	}
 
 	// --- Физкультура ---
@@ -90,7 +93,7 @@ func main() {
 			fmt.Printf("ОШИБКА поиска группы: %v\n", err)
 		} else {
 			fmt.Printf("UUID группы %q: %s\n", *group, uuid)
-			schedule, err := lks.GetTodaySchedule(uuid)
+			schedule, err := lks.GetWeekSchedule(uuid)
 			if err != nil {
 				fmt.Printf("ОШИБКА расписания: %v\n", err)
 			} else {

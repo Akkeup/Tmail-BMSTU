@@ -322,7 +322,7 @@ func (b *Bot) callbackSchedule(cq *tgbotapi.CallbackQuery) {
 
 	b.editNavFromCallback(cq, "📅 Загружаю расписание...", backKeyboard())
 
-	text, err := lks.GetTodaySchedule(user.GroupUUID)
+	text, err := lks.GetWeekSchedule(user.GroupUUID)
 	if err != nil {
 		b.editNav(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err), backKeyboard())
 		return
@@ -349,7 +349,7 @@ func (b *Bot) processGroupSetup(chatID int64, navMsgID int, groupName string) {
 		return
 	}
 
-	text, err := lks.GetTodaySchedule(uuid)
+	text, err := lks.GetWeekSchedule(uuid)
 	if err != nil {
 		b.editNav(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err), backKeyboard())
 		return
