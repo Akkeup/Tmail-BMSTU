@@ -83,8 +83,8 @@ func (b *Bot) handle(msg *tgbotapi.Message) {
 		case "login":
 			b.setState(msg.Chat.ID, &loginState{step: stepWaitEmail, createdAt: time.Now()})
 			b.send(msg.Chat.ID,
-				"Для подключения нужна баумановская почта и пароль от неё.\n\n"+
-					"⚠️ Логин вида smv24k043 не подойдёт — нужен полный адрес: smv24k043@student.bmstu.ru\n\n"+
+				"BMSTU Mail Bot — бот для переадресации писем с бауманской почты.\n\n"+
+					"Для подключения нужна полная бауманская почта (student.bmstu.ru) и пароль от неё.\n\n"+
 					"Введи адрес почты:",
 			)
 		case "logout":
