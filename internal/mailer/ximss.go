@@ -195,10 +195,51 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 	return msgs, nil
 }
 
+// fetchMIMEPartNames tries to get real filenames from the message MIME structure
+// via the XIMSS messageInfo command. Returns a map of partNum → filename.
+func fetchMIMEPartNames(s *ximssSession, uid uint32) map[int]string {
+	data, err := s.call(fmt.Sprintf(
+		`<XIMSS><messageInfo folder="%s" uid="%d" id="10"/></XIMSS>`,
+		inbox, uid,
+	))
+	if err != nil {
+		log.Printf("[ximss] messageInfo UID=%d err: %v", uid, err)
+		return nil
+	}
+	log.Printf("[ximss] messageInfo UID=%d: %s", uid, data)
+
+	var r struct {
+		XMLName xml.Name `xml:"XIMSS"`
+		Parts   []struct {
+			Num      int    `xml:"num,attr"`
+			Name     string `xml:"name,attr"`
+			Filename string `xml:"filename,attr"`
+			Charset  string `xml:"charset,attr"`
+		} `xml:"mimePart"`
+	}
+	if err := xml.Unmarshal(data, &r); err != nil {
+		log.Printf("[ximss] messageInfo parse err: %v", err)
+		return nil
+	}
+	names := make(map[int]string)
+	for _, p := range r.Parts {
+		if p.Num > 0 && (p.Filename != "" || p.Name != "") {
+			if p.Filename != "" {
+				names[p.Num] = p.Filename
+			} else {
+				names[p.Num] = p.Name
+			}
+		}
+	}
+	return names
+}
+
 func fetchAttachments(s *ximssSession, uid uint32) ([]Attachment, error) {
+	partNames := fetchMIMEPartNames(s, uid)
 	var attachments []Attachment
 	for partNum := 1; partNum <= 20; partNum++ {
-		att, skip, err := fetchPart(s, uid, partNum)
+		hint := partNames[partNum]
+		att, skip, err := fetchPart(s, uid, partNum, hint)
 		if err != nil {
 			break // part not found — no more parts
 		}
@@ -214,7 +255,8 @@ func fetchAttachments(s *ximssSession, uid uint32) ([]Attachment, error) {
 // Returns (att, false, nil) for an attachment part,
 // (zero, true, nil) for a body part to skip,
 // (zero, false, err) if the part doesn't exist.
-func fetchPart(s *ximssSession, uid uint32, partNum int) (Attachment, bool, error) {
+// nameHint, if non-empty, is used as the filename when the server doesn't provide one.
+func fetchPart(s *ximssSession, uid uint32, partNum int, nameHint string) (Attachment, bool, error) {
 	var resp *http.Response
 	for _, enc := range []string{"B", "Q"} {
 		u := fmt.Sprintf("%s/Session/%s/MIME/%s/%d-%02d-%s/x",
@@ -253,11 +295,11 @@ func fetchPart(s *ximssSession, uid uint32, partNum int) (Attachment, bool, erro
 		return Attachment{}, true, nil
 	}
 
-	// Try to get real filename from Content-Disposition header
+	// 1. Try Content-Disposition header
 	cd := resp.Header.Get("Content-Disposition")
 	filename := parseContentDisposition(cd)
 
-	// If server redirected us to a URL with the real filename, extract it
+	// 2. If server redirected to a URL with the real filename, extract it
 	if filename == "" || filename == "x" {
 		if finalPath := resp.Request.URL.Path; !strings.HasSuffix(finalPath, "/x") {
 			parts := strings.Split(finalPath, "/")
@@ -269,6 +311,12 @@ func fetchPart(s *ximssSession, uid uint32, partNum int) (Attachment, bool, erro
 		}
 	}
 
+	// 3. Use hint from XIMSS messageInfo
+	if (filename == "" || filename == "x") && nameHint != "" {
+		filename = nameHint
+	}
+
+	// 4. Fall back to mime-based generic name
 	if filename == "" || filename == "x" {
 		ext := ""
 		if exts, _ := mime.ExtensionsByType(baseType); len(exts) > 0 {
