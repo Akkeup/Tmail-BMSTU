@@ -82,7 +82,11 @@ func (b *Bot) handle(msg *tgbotapi.Message) {
 			)
 		case "login":
 			b.setState(msg.Chat.ID, &loginState{step: stepWaitEmail, createdAt: time.Now()})
-			b.send(msg.Chat.ID, "Введи адрес студенческой почты (@student.bmstu.ru):")
+			b.send(msg.Chat.ID,
+				"Для подключения нужна баумановская почта и пароль от неё.\n\n"+
+					"⚠️ Логин вида smv24k043 не подойдёт — нужен полный адрес: smv24k043@student.bmstu.ru\n\n"+
+					"Введи адрес почты:",
+			)
 		case "logout":
 			_ = b.store.Delete(msg.Chat.ID)
 			b.send(msg.Chat.ID, "Отключено. Уведомления остановлены.")
