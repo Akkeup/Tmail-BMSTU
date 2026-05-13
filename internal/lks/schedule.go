@@ -156,10 +156,10 @@ func currentWeekKey() (string, error) {
 func formatWeek(title string, lessons []scheduleLesson, weekKey string) string {
 	dayNames := []string{"", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"}
 
-	// Filter by current week, group by day
+	// Filter by current week; "all" means every week
 	byDay := make(map[int][]scheduleLesson)
 	for _, l := range lessons {
-		if l.Week != weekKey {
+		if l.Week != weekKey && l.Week != "all" {
 			continue
 		}
 		byDay[l.Day] = append(byDay[l.Day], l)
