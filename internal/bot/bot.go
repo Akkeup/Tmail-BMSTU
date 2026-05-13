@@ -175,26 +175,26 @@ func (b *Bot) checkUser(user storage.User) error {
 		)
 		if len(m.Attachments) == 0 {
 			b.send(user.ChatID, text)
-		} else {
-			// First attachment — with caption
-			first := m.Attachments[0]
-			doc := tgbotapi.NewDocument(user.ChatID, tgbotapi.FileBytes{
-				Name:  first.Name,
-				Bytes: first.Data,
-			})
+		} else if len(m.Attachments) == 1 {
+			att := m.Attachments[0]
+			doc := tgbotapi.NewDocument(user.ChatID, tgbotapi.FileBytes{Name: att.Name, Bytes: att.Data})
 			doc.Caption = text
 			if _, err := b.api.Send(doc); err != nil {
-				log.Printf("send attachment %s: %v", first.Name, err)
+				log.Printf("send attachment %s: %v", att.Name, err)
 			}
-			// Remaining attachments — separately
-			for _, att := range m.Attachments[1:] {
-				doc := tgbotapi.NewDocument(user.ChatID, tgbotapi.FileBytes{
-					Name:  att.Name,
-					Bytes: att.Data,
-				})
-				if _, err := b.api.Send(doc); err != nil {
-					log.Printf("send attachment %s: %v", att.Name, err)
+		} else {
+			// All attachments in one media group, caption on first
+			media := make([]interface{}, len(m.Attachments))
+			for i, att := range m.Attachments {
+				item := tgbotapi.NewInputMediaDocument(tgbotapi.FileBytes{Name: att.Name, Bytes: att.Data})
+				if i == 0 {
+					item.Caption = text
 				}
+				media[i] = item
+			}
+			mg := tgbotapi.NewMediaGroup(user.ChatID, media)
+			if _, err := b.api.Send(mg); err != nil {
+				log.Printf("send media group: %v", err)
 			}
 		}
 		if m.UID > user.LastUID {

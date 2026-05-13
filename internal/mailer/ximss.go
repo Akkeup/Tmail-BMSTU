@@ -253,16 +253,30 @@ func fetchPart(s *ximssSession, uid uint32, partNum int) (Attachment, bool, erro
 		return Attachment{}, true, nil
 	}
 
+	// Try to get real filename from Content-Disposition header
 	cd := resp.Header.Get("Content-Disposition")
-	log.Printf("[ximss] UID=%d part %02d Content-Disposition: %q", uid, partNum, cd)
 	filename := parseContentDisposition(cd)
-	if filename == "" {
+
+	// If server redirected us to a URL with the real filename, extract it
+	if filename == "" || filename == "x" {
+		if finalPath := resp.Request.URL.Path; !strings.HasSuffix(finalPath, "/x") {
+			parts := strings.Split(finalPath, "/")
+			if last := parts[len(parts)-1]; last != "" && last != "x" {
+				if decoded, err := url.PathUnescape(last); err == nil {
+					filename = decoded
+				}
+			}
+		}
+	}
+
+	if filename == "" || filename == "x" {
 		ext := ""
 		if exts, _ := mime.ExtensionsByType(baseType); len(exts) > 0 {
 			ext = exts[0]
 		}
 		filename = fmt.Sprintf("attachment-%d%s", partNum, ext)
 	}
+	log.Printf("[ximss] UID=%d part %02d filename=%q cd=%q", uid, partNum, filename, cd)
 
 	log.Printf("[ximss] attachment %s (%d bytes) UID=%d part=%02d", filename, len(data), uid, partNum)
 	return Attachment{Name: filename, ContentType: baseType, Data: data}, false, nil
