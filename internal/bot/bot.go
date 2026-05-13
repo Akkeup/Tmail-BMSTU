@@ -23,7 +23,7 @@ const (
 	cbSport    = "sport"
 	cbMap      = "map"
 
-	navText = "BMSTU Mail Bot — выбери раздел:"
+	navText = "Бауманец — выбери раздел:"
 )
 
 type loginStep int
@@ -107,10 +107,21 @@ func backKeyboard() tgbotapi.InlineKeyboardMarkup {
 
 // --- Nav message helpers ---
 
+const startText = "👋 Привет! Я Бауманец — бот для студентов МГТУ им. Баумана.\n\n" +
+	"Пока умею:\n" +
+	"• 📬 Уведомлять о новых письмах на student.bmstu.ru\n" +
+	"• 📅 Показывать расписание твоей группы\n" +
+	"• 🏃 Отслеживать посещения физкультуры\n\n" +
+	"Команды:\n" +
+	"/login — подключить почту\n" +
+	"/status — проверить статус подключения\n" +
+	"/logout — отключить уведомления\n\n" +
+	"Бауманец — выбери раздел:"
+
 // sendNav sends a new nav message and remembers its ID.
 func (b *Bot) sendNav(chatID int64) {
 	kb := mainKeyboard()
-	msg := tgbotapi.NewMessage(chatID, navText)
+	msg := tgbotapi.NewMessage(chatID, startText)
 	msg.ReplyMarkup = kb
 	sent, err := b.api.Send(msg)
 	if err != nil {
@@ -167,13 +178,6 @@ func (b *Bot) handle(msg *tgbotapi.Message) {
 		b.clearState(msg.Chat.ID)
 		switch msg.Command() {
 		case "start":
-			b.send(msg.Chat.ID,
-				"Привет! Я уведомляю о новых письмах на student.bmstu.ru.\n\n"+
-					"Команды:\n"+
-					"/login — подключить почту\n"+
-					"/status — проверить статус\n"+
-					"/logout — отключить уведомления",
-			)
 			b.sendNav(msg.Chat.ID)
 
 		case "login":
