@@ -23,6 +23,8 @@ type Attachment struct {
 	Name        string
 	ContentType string
 	Data        []byte
+	TooLarge    bool  // file exceeded Telegram's 50 MB limit
+	Size        int64 // original size in bytes (set when TooLarge)
 }
 
 type Message struct {
@@ -289,17 +291,9 @@ func fetchPart(s *ximssSession, uid uint32, partNum int, nameHint string) (Attac
 		return Attachment{}, true, nil
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentSize))
-	if err != nil || len(data) == 0 {
-		log.Printf("[ximss] UID=%d part %02d: read err=%v len=%d", uid, partNum, err, len(data))
-		return Attachment{}, true, nil
-	}
-
-	// 1. Try Content-Disposition header
+	// Resolve filename before reading body (needed for too-large reporting too)
 	cd := resp.Header.Get("Content-Disposition")
 	filename := parseContentDisposition(cd)
-
-	// 2. If server redirected to a URL with the real filename, extract it
 	if filename == "" || filename == "x" {
 		if finalPath := resp.Request.URL.Path; !strings.HasSuffix(finalPath, "/x") {
 			parts := strings.Split(finalPath, "/")
@@ -310,13 +304,9 @@ func fetchPart(s *ximssSession, uid uint32, partNum int, nameHint string) (Attac
 			}
 		}
 	}
-
-	// 3. Use hint from XIMSS messageInfo
 	if (filename == "" || filename == "x") && nameHint != "" {
 		filename = nameHint
 	}
-
-	// 4. Fall back to mime-based generic name
 	if filename == "" || filename == "x" {
 		ext := ""
 		if exts, _ := mime.ExtensionsByType(baseType); len(exts) > 0 {
@@ -324,9 +314,24 @@ func fetchPart(s *ximssSession, uid uint32, partNum int, nameHint string) (Attac
 		}
 		filename = fmt.Sprintf("attachment-%d%s", partNum, ext)
 	}
-	log.Printf("[ximss] UID=%d part %02d filename=%q cd=%q", uid, partNum, filename, cd)
 
-	log.Printf("[ximss] attachment %s (%d bytes) UID=%d part=%02d", filename, len(data), uid, partNum)
+	// Check Content-Length before downloading
+	if cl := resp.ContentLength; cl > maxAttachmentSize {
+		log.Printf("[ximss] UID=%d part %02d: too large (%d bytes)", uid, partNum, cl)
+		return Attachment{Name: filename, TooLarge: true, Size: cl}, false, nil
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentSize))
+	if err != nil || len(data) == 0 {
+		log.Printf("[ximss] UID=%d part %02d: read err=%v len=%d", uid, partNum, err, len(data))
+		return Attachment{}, true, nil
+	}
+	// If we read exactly the limit, the file was likely truncated
+	if int64(len(data)) == maxAttachmentSize {
+		log.Printf("[ximss] UID=%d part %02d: hit size limit, treating as too large", uid, partNum)
+		return Attachment{Name: filename, TooLarge: true, Size: maxAttachmentSize}, false, nil
+	}
+	log.Printf("[ximss] attachment %s (%d bytes) UID=%d part=%02d cd=%q", filename, len(data), uid, partNum, cd)
 	return Attachment{Name: filename, ContentType: baseType, Data: data}, false, nil
 }
 

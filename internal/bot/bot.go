@@ -11,6 +11,8 @@ import (
 	"tg-mail-bot/internal/storage"
 )
 
+const mb = 1024 * 1024
+
 type loginStep int
 
 const (
@@ -169,14 +171,32 @@ func (b *Bot) checkUser(user storage.User) error {
 		return err
 	}
 	for _, m := range msgs {
+		// Split attachments into sendable and too-large
+		var sendable []mailer.Attachment
+		var tooBig []mailer.Attachment
+		for _, att := range m.Attachments {
+			if att.TooLarge {
+				tooBig = append(tooBig, att)
+			} else {
+				sendable = append(sendable, att)
+			}
+		}
+
 		text := fmt.Sprintf(
 			"Новое письмо!\n\nОт: %s\nТема: %s\n\nОткрыть почту: %s",
 			m.From, m.Subject, mailer.WebmailURL,
 		)
-		if len(m.Attachments) == 0 {
+		for _, att := range tooBig {
+			text += fmt.Sprintf(
+				"\n\n⚠️ Вложение «%s» (%.1f МБ) слишком большое для отправки через Telegram — скачай напрямую с почты.",
+				att.Name, float64(att.Size)/mb,
+			)
+		}
+
+		if len(sendable) == 0 {
 			b.send(user.ChatID, text)
-		} else if len(m.Attachments) == 1 {
-			att := m.Attachments[0]
+		} else if len(sendable) == 1 {
+			att := sendable[0]
 			doc := tgbotapi.NewDocument(user.ChatID, tgbotapi.FileBytes{Name: att.Name, Bytes: att.Data})
 			doc.Caption = text
 			if _, err := b.api.Send(doc); err != nil {
@@ -184,8 +204,8 @@ func (b *Bot) checkUser(user storage.User) error {
 			}
 		} else {
 			// All attachments in one media group, caption on first
-			media := make([]interface{}, len(m.Attachments))
-			for i, att := range m.Attachments {
+			media := make([]interface{}, len(sendable))
+			for i, att := range sendable {
 				item := tgbotapi.NewInputMediaDocument(tgbotapi.FileBytes{Name: att.Name, Bytes: att.Data})
 				if i == 0 {
 					item.Caption = text
