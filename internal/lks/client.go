@@ -19,8 +19,6 @@ type Client struct {
 }
 
 // NewClient authenticates against LKS via Keycloak using BMSTU credentials.
-// email must be the full address (e.g. abc@student.bmstu.ru); the local part
-// is used as the Keycloak username.
 func NewClient(email, password string) (*Client, error) {
 	jar, _ := cookiejar.New(nil)
 	hc := &http.Client{
@@ -28,44 +26,64 @@ func NewClient(email, password string) (*Client, error) {
 		Jar:     jar,
 	}
 
-	// Step 1: kick off SSO — portal4 sets an initial p4sess and redirects to Keycloak
-	resp, err := hc.Get("https://lks.bmstu.ru/portal4/cookie/login?back=/&profile_any=true")
+	// Use a realistic User-Agent — some Keycloak configs check it
+	doGet := func(u string) (*http.Response, error) {
+		req, _ := http.NewRequest(http.MethodGet, u, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		return hc.Do(req)
+	}
+
+	// Step 1: kick off SSO — portal4 redirects to Keycloak
+	resp, err := doGet("https://lks.bmstu.ru/portal4/cookie/login?back=/&profile_any=true")
 	if err != nil {
 		return nil, fmt.Errorf("lks connect: %w", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-
 	// Step 2: extract the Keycloak login form action URL
 	formAction := extractFormAction(string(body))
 	if formAction == "" {
-		return nil, fmt.Errorf("lks: keycloak login form not found")
+		return nil, fmt.Errorf("lks: keycloak login form not found (landed on %s)", resp.Request.URL)
 	}
 
-	// Step 3: POST credentials — Keycloak will redirect back to portal4 on success
-	username := email
-	if i := strings.Index(email, "@"); i > 0 {
-		username = email[:i]
+	// Step 3: collect all form fields (hidden inputs included)
+	formFields := extractFormFields(string(body))
+
+	username := email // Keycloak expects full email as username
+
+	values := url.Values{}
+	for k, v := range formFields {
+		values.Set(k, v)
 	}
-	resp2, err := hc.PostForm(formAction, url.Values{
-		"username":     {username},
-		"password":     {password},
-		"credentialId": {""},
-	})
+	values.Set("username", username)
+	values.Set("password", password)
+	values.Set("credentialId", "")
+
+	req, _ := http.NewRequest(http.MethodPost, formAction, strings.NewReader(values.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", resp.Request.URL.String())
+
+	resp2, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("lks auth post: %w", err)
 	}
 	io.Copy(io.Discard, resp2.Body)
 	resp2.Body.Close()
 
-	// Step 4: verify the session cookie was set
+	// Session cookies are __portal3_login and __portal3_info
 	lksURL, _ := url.Parse("https://lks.bmstu.ru")
-	for _, c := range jar.Cookies(lksURL) {
-		if c.Name == "p4sess" {
-			return &Client{hc: hc}, nil
-		}
+	cookies := jar.Cookies(lksURL)
+	if len(cookies) > 0 {
+		return &Client{hc: hc}, nil
 	}
+
 	return nil, fmt.Errorf("неверный логин или пароль")
+}
+
+// APIGet makes an authenticated GET to the LKS backend API (exported for diagnostics).
+func APIGet(c *Client, path string) ([]byte, error) {
+	return c.get(path)
 }
 
 // get makes an authenticated GET request to the LKS backend API.
@@ -84,11 +102,58 @@ func (c *Client) get(path string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+// extractKeycloakError pulls the visible error message from a Keycloak login page.
+func extractKeycloakError(html string) string {
+	patterns := []string{
+		`(?s)<div[^>]*class="[^"]*alert[^"]*error[^"]*"[^>]*>.*?<p[^>]*>([^<]+)</p>`,
+		`(?s)<span[^>]*class="[^"]*pf-m-error[^"]*"[^>]*>([^<]+)</span>`,
+		`(?s)id="input-error"[^>]*>\s*([^<]+)<`,
+		`(?s)<p[^>]*class="[^"]*instruction[^"]*"[^>]*>([^<]+)</p>`,
+		`(?s)kc-feedback-text[^>]*>([^<]+)<`,
+	}
+	for _, p := range patterns {
+		if m := regexp.MustCompile(p).FindStringSubmatch(html); len(m) >= 2 {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	return ""
+}
+
+// extractFormFields parses all <input> fields from the Keycloak login form.
+// This ensures hidden fields (execution, etc.) are included in the POST.
+func extractFormFields(html string) map[string]string {
+	fields := make(map[string]string)
+	// Match <input ... name="..." ... value="..." ...>
+	re := regexp.MustCompile(`<input[^>]+>`)
+	for _, tag := range re.FindAllString(html, -1) {
+		name := extractAttr(tag, "name")
+		if name == "" {
+			continue
+		}
+		fields[name] = extractAttr(tag, "value")
+	}
+	return fields
+}
+
+// extractAttr pulls a named attribute value from an HTML tag string.
+func extractAttr(tag, attr string) string {
+	re := regexp.MustCompile(`(?i)` + attr + `="([^"]*)"`)
+	if m := re.FindStringSubmatch(tag); len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
 // extractFormAction finds the Keycloak login form action URL in the page HTML.
 func extractFormAction(html string) string {
-	// Keycloak renders <form id="kc-form-login" ... action="...">
+	// Keycloak login form has id="kc-form-login"; action can appear before or after id.
+	// Strategy: find the kc-form-login form tag, then extract its action attribute.
 	patterns := []string{
+		// action before id
+		`action="([^"]+)"[^>]*id="kc-form-login"`,
+		// id before action
 		`id="kc-form-login"[^>]*action="([^"]+)"`,
+		// fallback: any action pointing to sso.bmstu.ru
 		`action="(https://sso\.bmstu\.ru[^"]+)"`,
 	}
 	for _, p := range patterns {

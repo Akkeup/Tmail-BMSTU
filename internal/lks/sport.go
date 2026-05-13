@@ -7,149 +7,119 @@ import (
 	"strings"
 )
 
-// GetSportAttendance returns a formatted string with the user's FV
-// (физвоспитание) attendance and points for the current stage.
+// GetSportAttendance returns a formatted string with the user's FV attendance.
 func GetSportAttendance(c *Client) (string, error) {
-	// First discover available stages
-	stageUUID, err := getCurrentStageUUID(c)
+	// Try regular FV (military / general)
+	regular, err := fetchMilitaryEvents(c)
 	if err != nil {
-		return "", err
-	}
-	return fetchAttendance(c, stageUUID)
-}
-
-// getCurrentStageUUID tries several endpoints to find the active FV stage UUID.
-func getCurrentStageUUID(c *Client) (string, error) {
-	// Attempt 1: /fv — might list stages
-	data, err := c.get("/fv")
-	if err == nil {
-		log.Printf("[lks/fv] GET /fv: %s", data)
-		if uuid := extractFirstUUID(data); uuid != "" {
-			return uuid, nil
-		}
+		log.Printf("[lks/fv] military events error: %v", err)
 	}
 
-	// Attempt 2: /fv/stages
-	data, err = c.get("/fv/stages")
-	if err == nil {
-		log.Printf("[lks/fv] GET /fv/stages: %s", data)
-		if uuid := extractFirstUUID(data); uuid != "" {
-			return uuid, nil
-		}
-	}
-
-	return "", fmt.Errorf("не удалось определить текущий этап ФВ — попробуй позже")
-}
-
-// extractFirstUUID tries to pull the first uuid field from arbitrary JSON.
-func extractFirstUUID(data []byte) string {
-	var raw interface{}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return ""
-	}
-	return findUUIDField(raw)
-}
-
-func findUUIDField(v interface{}) string {
-	switch val := v.(type) {
-	case map[string]interface{}:
-		if u, ok := val["uuid"].(string); ok && u != "" {
-			return u
-		}
-		for _, child := range val {
-			if u := findUUIDField(child); u != "" {
-				return u
-			}
-		}
-	case []interface{}:
-		for _, item := range val {
-			if u := findUUIDField(item); u != "" {
-				return u
-			}
-		}
-	}
-	return ""
-}
-
-// --- Attendance response ---
-
-type fvMeResponse struct {
-	Data struct {
-		// Common fields — actual names depend on API; log raw for first run.
-		Visits     *int     `json:"visits"`
-		VisitCount *int     `json:"visitCount"`
-		Points     *float64 `json:"points"`
-		Score      *float64 `json:"score"`
-		Passed     *bool    `json:"passed"`
-		Status     string   `json:"status"`
-		Events     []struct {
-			Date   string `json:"date"`
-			Points int    `json:"points"`
-		} `json:"events"`
-	} `json:"data"`
-}
-
-func fetchAttendance(c *Client, stageUUID string) (string, error) {
-	data, err := c.get("/fv/" + stageUUID + "/me")
+	// Try swim FV
+	swim, err := fetchSwimEvents(c)
 	if err != nil {
-		return "", fmt.Errorf("FV данные: %w", err)
+		log.Printf("[lks/fv] swim events error: %v", err)
 	}
-	log.Printf("[lks/fv] GET /fv/%s/me: %s", stageUUID, data)
 
-	var resp fvMeResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return "", fmt.Errorf("FV parse: %w", err)
+	if regular == "" && swim == "" {
+		return "🏃 Физкультура\n\nДанных о посещениях не найдено.", nil
 	}
 
 	var sb strings.Builder
-	sb.WriteString("🏃 Физкультура — текущий семестр\n\n")
-
-	d := resp.Data
-
-	// Visits
-	visits := 0
-	if d.Visits != nil {
-		visits = *d.Visits
-	} else if d.VisitCount != nil {
-		visits = *d.VisitCount
+	sb.WriteString("🏃 Физкультура\n")
+	if regular != "" {
+		sb.WriteString("\n")
+		sb.WriteString(regular)
 	}
-	sb.WriteString(fmt.Sprintf("Посещений: %d\n", visits))
-
-	// Points
-	points := 0.0
-	if d.Points != nil {
-		points = *d.Points
-	} else if d.Score != nil {
-		points = *d.Score
+	if swim != "" {
+		sb.WriteString("\n")
+		sb.WriteString(swim)
 	}
-	sb.WriteString(fmt.Sprintf("Баллов: %.1f\n", points))
-
-	// Status
-	if d.Status != "" {
-		sb.WriteString(fmt.Sprintf("Статус: %s\n", d.Status))
-	} else if d.Passed != nil {
-		if *d.Passed {
-			sb.WriteString("Статус: зачтено ✅\n")
-		} else {
-			sb.WriteString("Статус: не зачтено ❌\n")
-		}
-	}
-
-	// Last visits list
-	if len(d.Events) > 0 {
-		sb.WriteString("\nПоследние посещения:\n")
-		limit := len(d.Events)
-		if limit > 5 {
-			limit = 5
-		}
-		for _, e := range d.Events[:limit] {
-			line := fmt.Sprintf("• %s", e.Date)
-			if e.Points > 0 {
-				line += fmt.Sprintf(" (+%d б.)", e.Points)
-			}
-			sb.WriteString(line + "\n")
-		}
-	}
-
 	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+type militaryEventsResp struct {
+	Items []struct {
+		Date   string `json:"date"`
+		Points int    `json:"points"`
+		Status string `json:"status"`
+	} `json:"items"`
+}
+
+func fetchMilitaryEvents(c *Client) (string, error) {
+	data, err := c.get("/fv/me/military_events")
+	if err != nil {
+		return "", err
+	}
+	log.Printf("[lks/fv] military_events: %s", data)
+
+	var resp militaryEventsResp
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return "", fmt.Errorf("parse: %w", err)
+	}
+	if len(resp.Items) == 0 {
+		return "", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Физподготовка — %d посещений:\n", len(resp.Items)))
+	totalPoints := 0
+	for _, e := range resp.Items {
+		line := fmt.Sprintf("• %s", e.Date)
+		if e.Points > 0 {
+			line += fmt.Sprintf(" (+%d б.)", e.Points)
+			totalPoints += e.Points
+		}
+		if e.Status != "" {
+			line += fmt.Sprintf(" [%s]", e.Status)
+		}
+		sb.WriteString(line + "\n")
+	}
+	if totalPoints > 0 {
+		sb.WriteString(fmt.Sprintf("Итого баллов: %d\n", totalPoints))
+	}
+	return sb.String(), nil
+}
+
+type swimEventsResp struct {
+	Items []struct {
+		Date   string `json:"date"`
+		Points int    `json:"points"`
+		Status string `json:"status"`
+	} `json:"items"`
+}
+
+func fetchSwimEvents(c *Client) (string, error) {
+	data, err := c.get("/fv-swim/me/events")
+	if err != nil {
+		return "", err
+	}
+	log.Printf("[lks/fv] swim events: %s", data)
+
+	var resp swimEventsResp
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return "", fmt.Errorf("parse: %w", err)
+	}
+	if len(resp.Items) == 0 {
+		return "", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Плавание — %d посещений:\n", len(resp.Items)))
+	totalPoints := 0
+	for _, e := range resp.Items {
+		line := fmt.Sprintf("• %s", e.Date)
+		if e.Points > 0 {
+			line += fmt.Sprintf(" (+%d б.)", e.Points)
+			totalPoints += e.Points
+		}
+		if e.Status != "" {
+			line += fmt.Sprintf(" [%s]", e.Status)
+		}
+		sb.WriteString(line + "\n")
+	}
+	if totalPoints > 0 {
+		sb.WriteString(fmt.Sprintf("Итого баллов: %d\n", totalPoints))
+	}
+	return sb.String(), nil
 }

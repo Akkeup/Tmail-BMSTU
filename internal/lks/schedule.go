@@ -51,15 +51,19 @@ func searchGroup(raw json.RawMessage, name string) string {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return ""
 	}
-	// Extract name and uuid fields
-	var objName, uuid string
+	// Extract name, abbr and uuid fields
+	var objName, objAbbr, uuid string
 	if v, ok := obj["name"]; ok {
 		json.Unmarshal(v, &objName)
+	}
+	if v, ok := obj["abbr"]; ok {
+		json.Unmarshal(v, &objAbbr)
 	}
 	if v, ok := obj["uuid"]; ok {
 		json.Unmarshal(v, &uuid)
 	}
-	if strings.EqualFold(strings.TrimSpace(objName), name) && uuid != "" {
+	if uuid != "" && (strings.EqualFold(strings.TrimSpace(objName), name) ||
+		strings.EqualFold(strings.TrimSpace(objAbbr), name)) {
 		return uuid
 	}
 	// Recurse into children / items
