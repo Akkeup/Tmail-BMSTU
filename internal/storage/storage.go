@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -138,7 +139,12 @@ func (s *Storage) save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, out, 0600)
+	// Write atomically: temp file in same directory, then rename
+	tmp := filepath.Join(filepath.Dir(s.path), ".users.json.tmp")
+	if err := os.WriteFile(tmp, out, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }
 
 func (s *Storage) Set(user *User) error {

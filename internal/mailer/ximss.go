@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -75,7 +76,6 @@ func openSession(email, password string) (*ximssSession, error) {
 	defer resp.Body.Close()
 
 	data, _ := io.ReadAll(resp.Body)
-	log.Printf("[ximss] login: %s", data)
 
 	var r struct {
 		XMLName  xml.Name `xml:"XIMSS"`
@@ -157,7 +157,7 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[ximss] folderOpen: %s", openData)
+	_ = openData
 
 	data, err := s.call(
 		`<XIMSS><folderBrowse folder="INBOX-MM-1" id="2"><index from="0" till="49"/></folderBrowse></XIMSS>`,
@@ -165,7 +165,6 @@ func browseFolder(s *ximssSession) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[ximss] folderBrowse: %s", data)
 
 	var r struct {
 		XMLName xml.Name `xml:"XIMSS"`
@@ -208,7 +207,7 @@ func fetchMIMEPartNames(s *ximssSession, uid uint32) map[int]string {
 		log.Printf("[ximss] messageInfo UID=%d err: %v", uid, err)
 		return nil
 	}
-	log.Printf("[ximss] messageInfo UID=%d: %s", uid, data)
+	log.Printf("[ximss] messageInfo UID=%d: ok (%d bytes)", uid, len(data))
 
 	var r struct {
 		XMLName xml.Name `xml:"XIMSS"`
@@ -314,6 +313,8 @@ func fetchPart(s *ximssSession, uid uint32, partNum int, nameHint string) (Attac
 		}
 		filename = fmt.Sprintf("attachment-%d%s", partNum, ext)
 	}
+	// Sanitize: strip any path components a malicious server might inject
+	filename = filepath.Base(filename)
 
 	// Check Content-Length before downloading
 	if cl := resp.ContentLength; cl > maxAttachmentSize {

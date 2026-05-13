@@ -25,11 +25,16 @@ func main() {
 		log.Fatalf("storage: %v", err)
 	}
 
+	const minPollInterval = 30 * time.Second
 	pollInterval := 2 * time.Minute
 	if v := os.Getenv("POLL_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			pollInterval = d
 		}
+	}
+	if pollInterval < minPollInterval {
+		log.Printf("POLL_INTERVAL too low, using minimum %v", minPollInterval)
+		pollInterval = minPollInterval
 	}
 
 	b, err := bot.New(token, store, pollInterval)

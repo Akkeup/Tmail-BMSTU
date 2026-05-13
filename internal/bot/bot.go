@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,7 +12,10 @@ import (
 	"tg-mail-bot/internal/storage"
 )
 
-const mb = 1024 * 1024
+const (
+	mb               = 1024 * 1024
+	loginStateExpiry = 10 * time.Minute
+)
 
 type loginStep int
 
@@ -22,8 +26,9 @@ const (
 )
 
 type loginState struct {
-	step  loginStep
-	email string
+	step      loginStep
+	email     string
+	createdAt time.Time
 }
 
 type Bot struct {
@@ -40,12 +45,14 @@ func New(token string, store *storage.Storage, pollInterval time.Duration) (*Bot
 		return nil, err
 	}
 	log.Printf("Authorized as @%s", api.Self.UserName)
-	return &Bot{
+	b := &Bot{
 		api:          api,
 		store:        store,
 		pollInterval: pollInterval,
 		states:       make(map[int64]*loginState),
-	}, nil
+	}
+	go b.expireStatesLoop()
+	return b, nil
 }
 
 func (b *Bot) Run() {
@@ -74,8 +81,8 @@ func (b *Bot) handle(msg *tgbotapi.Message) {
 					"/logout — отключить уведомления",
 			)
 		case "login":
-			b.setState(msg.Chat.ID, &loginState{step: stepWaitEmail})
-			b.send(msg.Chat.ID, "Введи адрес студенческой почты:")
+			b.setState(msg.Chat.ID, &loginState{step: stepWaitEmail, createdAt: time.Now()})
+			b.send(msg.Chat.ID, "Введи адрес студенческой почты (@student.bmstu.ru):")
 		case "logout":
 			_ = b.store.Delete(msg.Chat.ID)
 			b.send(msg.Chat.ID, "Отключено. Уведомления остановлены.")
@@ -104,14 +111,26 @@ func (b *Bot) handleText(msg *tgbotapi.Message) {
 
 	switch state.step {
 	case stepWaitEmail:
-		state.email = msg.Text
+		email := strings.TrimSpace(msg.Text)
+		if !strings.Contains(email, "@") || !strings.HasSuffix(email, "student.bmstu.ru") {
+			b.send(msg.Chat.ID, "Неверный формат. Введи адрес вида имя@student.bmstu.ru:")
+			return
+		}
+		state.email = email
 		state.step = stepWaitPassword
-		b.send(msg.Chat.ID, "Теперь введи пароль:\n(удали это сообщение после отправки)")
+		b.send(msg.Chat.ID, "Теперь введи пароль (сообщение будет удалено автоматически):")
 
 	case stepWaitPassword:
 		email := state.email
 		password := msg.Text
 		b.clearState(msg.Chat.ID)
+
+		// Delete password message from chat history immediately
+		del := tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)
+		if _, err := b.api.Send(del); err != nil {
+			log.Printf("delete password msg: %v", err)
+		}
+
 		b.processLogin(msg.Chat.ID, email, password)
 	}
 }
@@ -153,13 +172,29 @@ func (b *Bot) clearState(chatID int64) {
 	delete(b.states, chatID)
 }
 
+// expireStatesLoop removes login sessions that were started but never completed.
+func (b *Bot) expireStatesLoop() {
+	ticker := time.NewTicker(loginStateExpiry)
+	defer ticker.Stop()
+	for range ticker.C {
+		b.statesMu.Lock()
+		now := time.Now()
+		for chatID, s := range b.states {
+			if now.Sub(s.createdAt) > loginStateExpiry {
+				delete(b.states, chatID)
+			}
+		}
+		b.statesMu.Unlock()
+	}
+}
+
 func (b *Bot) pollLoop() {
 	ticker := time.NewTicker(b.pollInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		for _, user := range b.store.All() {
 			if err := b.checkUser(user); err != nil {
-				log.Printf("[chat %d] poll error: %v", user.ChatID, err)
+				log.Printf("poll error: %v", err)
 			}
 		}
 	}
@@ -230,6 +265,6 @@ func (b *Bot) checkUser(user storage.User) error {
 func (b *Bot) send(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("send to %d: %v", chatID, err)
+		log.Printf("send: %v", err)
 	}
 }
