@@ -169,17 +169,32 @@ func (b *Bot) checkUser(user storage.User) error {
 		return err
 	}
 	for _, m := range msgs {
-		b.send(user.ChatID, fmt.Sprintf(
+		text := fmt.Sprintf(
 			"Новое письмо!\n\nОт: %s\nТема: %s\n\nОткрыть почту: %s",
 			m.From, m.Subject, mailer.WebmailURL,
-		))
-		for _, att := range m.Attachments {
+		)
+		if len(m.Attachments) == 0 {
+			b.send(user.ChatID, text)
+		} else {
+			// First attachment — with caption
+			first := m.Attachments[0]
 			doc := tgbotapi.NewDocument(user.ChatID, tgbotapi.FileBytes{
-				Name:  att.Name,
-				Bytes: att.Data,
+				Name:  first.Name,
+				Bytes: first.Data,
 			})
+			doc.Caption = text
 			if _, err := b.api.Send(doc); err != nil {
-				log.Printf("send attachment %s: %v", att.Name, err)
+				log.Printf("send attachment %s: %v", first.Name, err)
+			}
+			// Remaining attachments — separately
+			for _, att := range m.Attachments[1:] {
+				doc := tgbotapi.NewDocument(user.ChatID, tgbotapi.FileBytes{
+					Name:  att.Name,
+					Bytes: att.Data,
+				})
+				if _, err := b.api.Send(doc); err != nil {
+					log.Printf("send attachment %s: %v", att.Name, err)
+				}
 			}
 		}
 		if m.UID > user.LastUID {
