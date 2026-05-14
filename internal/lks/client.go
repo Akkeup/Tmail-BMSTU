@@ -94,11 +94,13 @@ func (c *Client) get(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("сессия истекла")
-	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("lks api %s: status %d", path, resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		snippet := string(body)
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		return nil, fmt.Errorf("lks api %s: status %d body=%s", path, resp.StatusCode, snippet)
 	}
 	return io.ReadAll(resp.Body)
 }
