@@ -364,27 +364,7 @@ func (b *Bot) processGroupSetup(chatID int64, navMsgID int, groupName string) {
 // --- Sport ---
 
 func (b *Bot) callbackSport(cq *tgbotapi.CallbackQuery) {
-	chatID := cq.Message.Chat.ID
-
-	user, ok := b.store.Get(chatID)
-	if !ok {
-		b.editNavFromCallback(cq, "Сначала подключи почту через /login", backKeyboard())
-		return
-	}
-
-	b.editNavFromCallback(cq, "🏃 Загружаю данные физкультуры...", backKeyboard())
-
-	c, err := lks.NewClient(user.Email, user.Password)
-	if err != nil {
-		b.editNav(chatID, fmt.Sprintf("Ошибка входа в ЛКС: %v", err), backKeyboard())
-		return
-	}
-	text, err := lks.GetSportAttendance(c)
-	if err != nil {
-		b.editNav(chatID, fmt.Sprintf("Ошибка загрузки данных: %v", err), backKeyboard())
-		return
-	}
-	b.editNav(chatID, text, backKeyboard())
+	b.editNavFromCallback(cq, "🏃 Физкультура\n\n🔧 Раздел находится в разработке, скоро появится!", backKeyboard())
 }
 
 // --- State management ---
