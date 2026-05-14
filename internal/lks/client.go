@@ -71,11 +71,12 @@ func NewClient(email, password string) (*Client, error) {
 	io.Copy(io.Discard, resp2.Body)
 	resp2.Body.Close()
 
-	// Session cookies are __portal3_login and __portal3_info
+	// Проверяем наличие сессионной куки __portal3_login
 	lksURL, _ := url.Parse("https://lks.bmstu.ru")
-	cookies := jar.Cookies(lksURL)
-	if len(cookies) > 0 {
-		return &Client{hc: hc}, nil
+	for _, ck := range jar.Cookies(lksURL) {
+		if ck.Name == "__portal3_login" && ck.Value != "" {
+			return &Client{hc: hc}, nil
+		}
 	}
 
 	return nil, fmt.Errorf("неверный логин или пароль")
