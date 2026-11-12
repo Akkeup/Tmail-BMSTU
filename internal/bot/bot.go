@@ -1,8 +1,11 @@
 package bot
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -19,9 +22,10 @@ const (
 
 	// Callback data for inline keyboard buttons
 	cbMenu     = "menu"
-	cbSchedule = "schedule"
 	cbSport    = "sport"
 	cbMap      = "map"
+	cbOtherDay = "other_day"
+	cbSettings = "settings"
 
 	navText = "Бауманец — выбери раздел:"
 )
@@ -33,13 +37,13 @@ const (
 	stepWaitEmail
 	stepWaitPassword
 	stepWaitGroup
+	stepWaitDate
 )
 
 type loginState struct {
 	step      loginStep
 	email     string
 	createdAt time.Time
-	navMsgID  int // nav message to edit after group setup
 }
 
 type Bot struct {
@@ -53,7 +57,7 @@ type Bot struct {
 }
 
 func New(token string, store *storage.Storage, pollInterval time.Duration) (*Bot, error) {
-	api, err := tgbotapi.NewBotAPI(token)
+	api, err := tgbotapi.NewBotAPIWithClient(token, tgbotapi.APIEndpoint, telegramHTTPClient())
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +71,24 @@ func New(token string, store *storage.Storage, pollInterval time.Duration) (*Bot
 	}
 	go b.expireStatesLoop()
 	return b, nil
+}
+
+func telegramHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:   false,
+		TLSHandshakeTimeout: 20 * time.Second,
+		// Telegram long polling waits up to 60 seconds for getUpdates.
+		ResponseHeaderTimeout: 90 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			// The default Go resolver may select an unreachable IPv6 route in
+			// the current environment while curl reaches Telegram over IPv4.
+			return dialer.DialContext(ctx, "tcp4", addr)
+		},
+	}
+	return &http.Client{Transport: transport, Timeout: 120 * time.Second}
 }
 
 func (b *Bot) Run() {
@@ -88,11 +110,26 @@ func (b *Bot) Run() {
 func mainKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📅 Расписание", cbSchedule),
-			tgbotapi.NewInlineKeyboardButtonData("🏃 Физкультура", cbSport),
+			tgbotapi.NewInlineKeyboardButtonData("📅 Другой день", cbOtherDay),
+			tgbotapi.NewInlineKeyboardButtonData("⚙ Настройки", cbSettings),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🏃 Физкультура", cbSport),
 			tgbotapi.NewInlineKeyboardButtonData("🗺 Карта", cbMap),
+		),
+	)
+}
+
+func scheduleKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(tgbotapi.NewKeyboardButton("📅 Расписание")),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("📅 Сегодня"),
+			tgbotapi.NewKeyboardButton("📆 Завтра"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("🗓 Неделя"),
+			tgbotapi.NewKeyboardButton("📋 Меню"),
 		),
 	)
 }
@@ -120,9 +157,8 @@ const startText = "👋 Привет! Я Бауманец — бот для ст
 
 // sendNav sends a new nav message and remembers its ID.
 func (b *Bot) sendNav(chatID int64) {
-	kb := mainKeyboard()
 	msg := tgbotapi.NewMessage(chatID, startText)
-	msg.ReplyMarkup = kb
+	msg.ReplyMarkup = scheduleKeyboard()
 	sent, err := b.api.Send(msg)
 	if err != nil {
 		log.Printf("sendNav: %v", err)
@@ -207,6 +243,10 @@ func (b *Bot) handle(msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleText(msg *tgbotapi.Message) {
+	if b.handleScheduleButton(msg) {
+		return
+	}
+
 	b.statesMu.Lock()
 	state := b.states[msg.Chat.ID]
 	b.statesMu.Unlock()
@@ -239,10 +279,85 @@ func (b *Bot) handleText(msg *tgbotapi.Message) {
 		b.processLogin(msg.Chat.ID, email, password)
 
 	case stepWaitGroup:
-		navMsgID := state.navMsgID
 		b.clearState(msg.Chat.ID)
-		b.processGroupSetup(msg.Chat.ID, navMsgID, msg.Text)
+		b.processGroupSetup(msg.Chat.ID, msg.Text)
+
+	case stepWaitDate:
+		b.clearState(msg.Chat.ID)
+		date, err := time.Parse("02.01.2006", strings.TrimSpace(msg.Text))
+		if err != nil {
+			b.send(msg.Chat.ID, "Не удалось распознать дату. Используй формат ДД.ММ.ГГГГ, например 12.11.2026")
+			return
+		}
+		b.showDaySchedule(msg.Chat.ID, date)
 	}
+}
+
+func (b *Bot) handleScheduleButton(msg *tgbotapi.Message) bool {
+	var date *time.Time
+	switch strings.TrimSpace(msg.Text) {
+	case "📅 Расписание", "🗓 Неделя":
+		b.showWeekSchedule(msg.Chat.ID)
+		return true
+	case "📅 Сегодня":
+		now := time.Now()
+		date = &now
+	case "📆 Завтра":
+		tomorrow := time.Now().AddDate(0, 0, 1)
+		date = &tomorrow
+	case "📋 Меню":
+		b.sendMenu(msg.Chat.ID)
+		return true
+	default:
+		return false
+	}
+	b.showDaySchedule(msg.Chat.ID, *date)
+	return true
+}
+
+func (b *Bot) sendMenu(chatID int64) {
+	msg := tgbotapi.NewMessage(chatID,
+		"📋 Меню\n\nВыбери нужный раздел:")
+	msg.ReplyMarkup = mainKeyboard()
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("sendMenu: %v", err)
+	}
+}
+
+func (b *Bot) showWeekSchedule(chatID int64) {
+	user, ok := b.store.Get(chatID)
+	if !ok {
+		b.send(chatID, "Сначала подключи почту через /login")
+		return
+	}
+	if user.GroupUUID == "" {
+		b.send(chatID, "Сначала укажи группу через 📋 Меню → ⚙ Настройки")
+		return
+	}
+	text, err := lks.GetWeekSchedule(user.GroupUUID)
+	if err != nil {
+		b.send(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err))
+		return
+	}
+	b.send(chatID, text)
+}
+
+func (b *Bot) showDaySchedule(chatID int64, date time.Time) {
+	user, ok := b.store.Get(chatID)
+	if !ok {
+		b.send(chatID, "Сначала подключи почту через /login")
+		return
+	}
+	if user.GroupUUID == "" {
+		b.send(chatID, "Сначала укажи группу через 📋 Меню → ⚙ Настройки")
+		return
+	}
+	text, err := lks.GetDaySchedule(user.GroupUUID, date)
+	if err != nil {
+		b.send(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err))
+		return
+	}
+	b.send(chatID, text)
 }
 
 // --- Callback handler ---
@@ -251,21 +366,21 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 	// Acknowledge the callback to remove the loading spinner
 	b.api.Send(tgbotapi.NewCallback(cq.ID, ""))
 
-	chatID := cq.Message.Chat.ID
-
 	switch cq.Data {
 	case cbMenu:
 		b.editNavFromCallback(cq, navText, mainKeyboard())
 
-	case cbSchedule:
-		b.callbackSchedule(cq)
+	case cbOtherDay:
+		b.askOtherDay(cq)
+
+	case cbSettings:
+		b.showSettings(cq)
 
 	case cbSport:
 		b.callbackSport(cq)
 
 	case cbMap:
 		b.editNavFromCallback(cq, "🗺 Карта университета будет добавлена в ближайшее время.", backKeyboard())
-		_ = chatID
 	}
 }
 
@@ -296,53 +411,7 @@ func (b *Bot) processLogin(chatID int64, email, password string) {
 
 // --- Schedule ---
 
-func (b *Bot) callbackSchedule(cq *tgbotapi.CallbackQuery) {
-	chatID := cq.Message.Chat.ID
-	msgID := cq.Message.MessageID
-
-	user, ok := b.store.Get(chatID)
-	if !ok {
-		b.editNavFromCallback(cq, "Сначала подключи почту через /login", backKeyboard())
-		return
-	}
-
-	if user.GroupUUID == "" {
-		// Ask for group — edit nav to prompt, set state
-		b.navMu.Lock()
-		b.navMsgs[chatID] = msgID
-		b.navMu.Unlock()
-
-		b.setState(chatID, &loginState{
-			step:      stepWaitGroup,
-			createdAt: time.Now(),
-			navMsgID:  msgID,
-		})
-		b.editNavFromCallback(cq,
-			"📅 Расписание\n\nВведи название своей группы (например: ИУ7-21Б):",
-			backKeyboard(),
-		)
-		return
-	}
-
-	b.editNavFromCallback(cq, "📅 Загружаю расписание...", backKeyboard())
-
-	text, err := lks.GetWeekSchedule(user.GroupUUID)
-	if err != nil {
-		b.editNav(chatID, fmt.Sprintf("Ошибка загрузки расписания: %v", err), backKeyboard())
-		return
-	}
-	b.editNav(chatID, text, backKeyboard())
-}
-
-func (b *Bot) processGroupSetup(chatID int64, navMsgID int, groupName string) {
-	// Update nav message to show loading
-	if navMsgID != 0 {
-		kb := backKeyboard()
-		edit := tgbotapi.NewEditMessageText(chatID, navMsgID, "📅 Расписание\n\nИщу группу...")
-		edit.ReplyMarkup = &kb
-		b.api.Send(edit)
-	}
-
+func (b *Bot) processGroupSetup(chatID int64, groupName string) {
 	uuid, err := lks.FindGroupUUID(groupName)
 	if err != nil {
 		b.editNav(chatID, fmt.Sprintf("📅 Расписание\n\n%v\n\nПроверь название и нажми кнопку снова.", err), backKeyboard())
@@ -364,7 +433,42 @@ func (b *Bot) processGroupSetup(chatID int64, navMsgID int, groupName string) {
 // --- Sport ---
 
 func (b *Bot) callbackSport(cq *tgbotapi.CallbackQuery) {
-	b.editNavFromCallback(cq, "🏃 Физкультура\n\n🔧 Раздел находится в разработке, скоро появится!", backKeyboard())
+	user, ok := b.store.Get(cq.Message.Chat.ID)
+	if !ok {
+		b.editNavFromCallback(cq, "Сначала подключи почту через /login", backKeyboard())
+		return
+	}
+	b.editNavFromCallback(cq, "🏃 Загружаю данные физкультуры...", backKeyboard())
+	client, err := lks.NewClient(user.Email, user.Password)
+	if err != nil {
+		b.editNav(cq.Message.Chat.ID, fmt.Sprintf("Ошибка загрузки физкультуры: %v", err), backKeyboard())
+		return
+	}
+	text, err := lks.GetSportAttendance(client)
+	if err != nil {
+		b.editNav(cq.Message.Chat.ID, fmt.Sprintf("Ошибка загрузки физкультуры: %v", err), backKeyboard())
+		return
+	}
+	b.editNav(cq.Message.Chat.ID, text, backKeyboard())
+}
+
+func (b *Bot) askOtherDay(cq *tgbotapi.CallbackQuery) {
+	chatID := cq.Message.Chat.ID
+	b.setState(chatID, &loginState{step: stepWaitDate, createdAt: time.Now()})
+	b.editNavFromCallback(cq,
+		"📅 Другой день\n\nВведи дату в формате ДД.ММ.ГГГГ:",
+		backKeyboard())
+}
+
+func (b *Bot) showSettings(cq *tgbotapi.CallbackQuery) {
+	user, ok := b.store.Get(cq.Message.Chat.ID)
+	if !ok {
+		b.editNavFromCallback(cq, "Сначала подключи почту через /login", backKeyboard())
+		return
+	}
+	text := fmt.Sprintf("⚙ Настройки\n\nТекущая группа: %s\n\nВведи новую группу следующим сообщением.", user.Group)
+	b.setState(cq.Message.Chat.ID, &loginState{step: stepWaitGroup, createdAt: time.Now()})
+	b.editNavFromCallback(cq, text, backKeyboard())
 }
 
 // --- State management ---

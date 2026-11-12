@@ -39,7 +39,9 @@ func main() {
 
 	b, err := bot.New(token, store, pollInterval)
 	if err != nil {
-		log.Fatalf("bot: %v", err)
+		// Do not print the library error verbatim: Telegram API errors can
+		// include the bot token in the request URL.
+		log.Fatal("bot: Telegram API initialization failed")
 	}
 
 	log.Printf("Bot started, polling every %v", pollInterval)

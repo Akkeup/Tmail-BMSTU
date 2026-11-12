@@ -20,6 +20,23 @@ type Client struct {
 
 // NewClient authenticates against LKS via Keycloak using BMSTU credentials.
 func NewClient(email, password string) (*Client, error) {
+	usernames := []string{email}
+	if at := strings.IndexByte(email, '@'); at > 0 {
+		usernames = append(usernames, email[:at])
+	}
+
+	var lastErr error
+	for _, username := range usernames {
+		client, err := newClient(email, password, username)
+		if err == nil {
+			return client, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func newClient(email, password, username string) (*Client, error) {
 	jar, _ := cookiejar.New(nil)
 	hc := &http.Client{
 		Timeout: 20 * time.Second,
@@ -49,8 +66,6 @@ func NewClient(email, password string) (*Client, error) {
 	// Step 3: collect all form fields (hidden inputs included)
 	formFields := extractFormFields(string(body))
 
-	username := email // Keycloak expects full email as username
-
 	values := url.Values{}
 	for k, v := range formFields {
 		values.Set(k, v)
@@ -68,7 +83,7 @@ func NewClient(email, password string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("lks auth post: %w", err)
 	}
-	io.Copy(io.Discard, resp2.Body)
+	body2, _ := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
 
 	// Проверяем наличие сессионной куки __portal3_login
@@ -79,12 +94,10 @@ func NewClient(email, password string) (*Client, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("неверный логин или пароль")
-}
-
-// APIGet makes an authenticated GET to the LKS backend API (exported for diagnostics).
-func APIGet(c *Client, path string) ([]byte, error) {
-	return c.get(path)
+	if message := extractKeycloakError(string(body2)); message != "" {
+		return nil, fmt.Errorf("lks auth: %s", message)
+	}
+	return nil, fmt.Errorf("lks auth failed: status %d, redirect %s", resp2.StatusCode, resp2.Request.URL)
 }
 
 // get makes an authenticated GET request to the LKS backend API.
