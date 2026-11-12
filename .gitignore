@@ -1,17 +1,48 @@
-# Environment
+# Secrets and local configuration
 .env
+.env.*
+!.env.example
 
-# Bot data (contains user passwords)
+# Runtime data and local backups
 data/
+*.backup
+*.bak
 
-# Compiled binary
+# Go build artifacts and coverage files
 /bot
-
-# Go build cache
+/broadcast
+/lkstest
+*.exe
 *.test
 *.out
+coverage.out
 
-# IDE
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+
+# Docker/local overrides
+docker-compose.override.yml
+
+# IDE and local agent settings
 .idea/
 .vscode/
+.claude/
 *.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Go workspace files
+go.work
+go.work.sum
