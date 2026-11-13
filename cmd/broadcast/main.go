@@ -22,7 +22,8 @@ import (
 
 func main() {
 	msg := flag.String("msg", "", "Текст сообщения (обязательно)")
-	dataPath := flag.String("data", "data/users.json", "Путь к файлу пользователей")
+	dataPath := flag.String("data", "data/bot.db", "Путь к SQLite-базе")
+	legacyPath := flag.String("legacy-data", "data/users.json", "Старый JSON-файл для миграции")
 	flag.Parse()
 
 	if *msg == "" {
@@ -39,10 +40,11 @@ func main() {
 		log.Fatal("SECRET_KEY не задан")
 	}
 
-	store, err := storage.New(*dataPath, secret)
+	store, err := storage.NewSQLite(*dataPath, *legacyPath, secret)
 	if err != nil {
 		log.Fatalf("storage: %v", err)
 	}
+	defer store.Close()
 
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {

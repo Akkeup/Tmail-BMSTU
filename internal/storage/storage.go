@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 type User struct {
@@ -28,14 +30,14 @@ type Storage struct {
 	path  string
 	users map[int64]*User
 	key   []byte
+	db    *sql.DB
 }
 
 func New(path, secret string) (*Storage, error) {
-	h := sha256.Sum256([]byte(secret))
 	s := &Storage{
 		path:  path,
 		users: make(map[int64]*User),
-		key:   h[:],
+		key:   secretKey(secret),
 	}
 	if err := s.load(); err != nil && !os.IsNotExist(err) {
 		return nil, err
@@ -47,6 +49,11 @@ func New(path, secret string) (*Storage, error) {
 		}
 	}
 	return s, nil
+}
+
+func secretKey(secret string) []byte {
+	h := sha256.Sum256([]byte(secret))
+	return h[:]
 }
 
 func (s *Storage) encrypt(plaintext string) (string, error) {
@@ -112,6 +119,9 @@ func (s *Storage) load() error {
 	for id, u := range raw {
 		pwd, err := s.decrypt(u.Password)
 		if err != nil {
+			if looksLikeEncryptedPassword(u.Password) {
+				return fmt.Errorf("не удалось расшифровать пароль пользователя %d: проверь SECRET_KEY", id)
+			}
 			// backward compat: file written before encryption was added
 			pwd = u.Password
 		}
@@ -125,6 +135,15 @@ func (s *Storage) load() error {
 		}
 	}
 	return nil
+}
+
+func looksLikeEncryptedPassword(value string) bool {
+	data, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return false
+	}
+	// AES-GCM stores a 12-byte nonce and at least a 16-byte authentication tag.
+	return len(data) >= 28
 }
 
 func (s *Storage) save() error {
@@ -158,6 +177,9 @@ func (s *Storage) save() error {
 func (s *Storage) Set(user *User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		return s.setSQLite(user)
+	}
 	s.users[user.ChatID] = user
 	return s.save()
 }
@@ -165,6 +187,21 @@ func (s *Storage) Set(user *User) error {
 func (s *Storage) Get(chatID int64) (User, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.db != nil {
+		var user User
+		var encrypted string
+		err := s.db.QueryRow(`SELECT chat_id,email,password,last_uid,group_name,group_uuid FROM users WHERE chat_id=?`, chatID).
+			Scan(&user.ChatID, &user.Email, &encrypted, &user.LastUID, &user.Group, &user.GroupUUID)
+		if err != nil {
+			return User{}, false
+		}
+		password, err := s.decrypt(encrypted)
+		if err != nil {
+			return User{}, false
+		}
+		user.Password = password
+		return user, true
+	}
 	u, ok := s.users[chatID]
 	if !ok {
 		return User{}, false
@@ -175,6 +212,13 @@ func (s *Storage) Get(chatID int64) (User, bool) {
 func (s *Storage) Delete(chatID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		_, err := s.db.Exec(`DELETE FROM users WHERE chat_id=?`, chatID)
+		if err == nil {
+			_, err = s.db.Exec(`DELETE FROM mail_messages WHERE chat_id=?`, chatID)
+		}
+		return err
+	}
 	delete(s.users, chatID)
 	return s.save()
 }
@@ -182,6 +226,24 @@ func (s *Storage) Delete(chatID int64) error {
 func (s *Storage) All() []User {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.db != nil {
+		rows, err := s.db.Query(`SELECT chat_id,email,password,last_uid,group_name,group_uuid FROM users`)
+		if err != nil {
+			return nil
+		}
+		defer rows.Close()
+		users := make([]User, 0)
+		for rows.Next() {
+			var user User
+			var encrypted string
+			if rows.Scan(&user.ChatID, &user.Email, &encrypted, &user.LastUID, &user.Group, &user.GroupUUID) != nil {
+				continue
+			}
+			user.Password, _ = s.decrypt(encrypted)
+			users = append(users, user)
+		}
+		return users
+	}
 	users := make([]User, 0, len(s.users))
 	for _, u := range s.users {
 		users = append(users, *u)
@@ -192,6 +254,10 @@ func (s *Storage) All() []User {
 func (s *Storage) UpdateLastUID(chatID int64, uid uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		_, err := s.db.Exec(`UPDATE users SET last_uid=?, updated_at=? WHERE chat_id=?`, uid, time.Now().Unix(), chatID)
+		return err
+	}
 	if u, ok := s.users[chatID]; ok {
 		u.LastUID = uid
 		return s.save()
@@ -202,6 +268,10 @@ func (s *Storage) UpdateLastUID(chatID int64, uid uint32) error {
 func (s *Storage) UpdateGroup(chatID int64, group, groupUUID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db != nil {
+		_, err := s.db.Exec(`UPDATE users SET group_name=?, group_uuid=?, updated_at=? WHERE chat_id=?`, group, groupUUID, time.Now().Unix(), chatID)
+		return err
+	}
 	if u, ok := s.users[chatID]; ok {
 		u.Group = group
 		u.GroupUUID = groupUUID

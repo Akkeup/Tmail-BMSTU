@@ -7,13 +7,27 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	scheduleRequestTimeout = 30 * time.Second
-	scheduleRequestRetries = 3
+	scheduleRequestRetries = 2
+	scheduleCacheTTL       = 90 * time.Second
 )
+
+type scheduleCacheEntry struct {
+	data      []byte
+	expiresAt time.Time
+}
+
+var scheduleCache = struct {
+	sync.RWMutex
+	entries map[string]scheduleCacheEntry
+}{entries: make(map[string]scheduleCacheEntry)}
+
+var scheduleHTTPClient = &http.Client{Timeout: scheduleRequestTimeout}
 
 // FindGroupUUID searches the public university structure for a group by name.
 func FindGroupUUID(groupName string) (string, error) {
@@ -185,22 +199,36 @@ func currentWeekKey() (string, error) {
 	if err := json.Unmarshal(data, &cw); err != nil {
 		return "", fmt.Errorf("current week parse: %w", err)
 	}
-	// weekShortName: "чн" → "ch", "зн" → "zn"
-	if strings.Contains(cw.Data.WeekShortName, "зн") {
+	return normalizeWeekKey(cw.Data.WeekShortName)
+}
+
+func normalizeWeekKey(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "зн", "zn", "знаменатель":
 		return "zn", nil
+	case "чн", "ch", "числитель":
+		return "ch", nil
+	default:
+		return "", fmt.Errorf("неизвестный тип недели: %q", value)
 	}
-	return "ch", nil
 }
 
 // getScheduleData tolerates temporary LKS outages and slow responses. The
 // schedule API is external to the bot, so a single missed response should not
 // immediately become a user-visible failure.
 func getScheduleData(endpoint string) ([]byte, error) {
-	client := &http.Client{Timeout: scheduleRequestTimeout}
+	now := time.Now()
+	scheduleCache.RLock()
+	cached, ok := scheduleCache.entries[endpoint]
+	scheduleCache.RUnlock()
+	if ok && now.Before(cached.expiresAt) {
+		return append([]byte(nil), cached.data...), nil
+	}
+
 	var lastErr error
 
 	for attempt := 1; attempt <= scheduleRequestRetries; attempt++ {
-		resp, err := client.Get(endpoint)
+		resp, err := scheduleHTTPClient.Get(endpoint)
 		if err != nil {
 			lastErr = err
 		} else {
@@ -209,6 +237,12 @@ func getScheduleData(endpoint string) ([]byte, error) {
 			if readErr != nil {
 				lastErr = readErr
 			} else if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				scheduleCache.Lock()
+				scheduleCache.entries[endpoint] = scheduleCacheEntry{
+					data:      append([]byte(nil), data...),
+					expiresAt: time.Now().Add(scheduleCacheTTL),
+				}
+				scheduleCache.Unlock()
 				return data, nil
 			} else if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 				return nil, fmt.Errorf("status %d body=%s", resp.StatusCode, shortBody(data))
@@ -218,7 +252,7 @@ func getScheduleData(endpoint string) ([]byte, error) {
 		}
 
 		if attempt < scheduleRequestRetries {
-			time.Sleep(time.Duration(attempt) * 750 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
 	return nil, fmt.Errorf("after %d attempts: %w", scheduleRequestRetries, lastErr)
